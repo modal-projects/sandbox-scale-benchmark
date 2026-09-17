@@ -52,6 +52,7 @@ def _shard_env(idx: int, size: int, base: int, cfg: Config, wenv: dict[str, str]
         "CLIENTS": str(cfg.clients),
         "WAIT_FOR_SHARD_CREATES": "1" if cfg.wait_for_shard_creates else "0",
         "SANDBOX_TIMEOUT_S": str(cfg.sandbox_timeout_s),
+        "SANDBOX_LIFETIME_S": str(cfg.sandbox_lifetime_s),
         "SANDBOX_APP_NAME": SANDBOX_APP_NAME,
         **wenv,
     }
@@ -177,7 +178,7 @@ def _print_summary(meta: dict[str, Any]) -> None:
     build = meta.get("build_ms_distribution") or {}
     print()
     print("=" * 64)
-    print(" modal-burst :: SQLite build")
+    print(" modal-burst :: sandbox burst")
     print("=" * 64)
     print(f"  run_id:        {meta['run_id']}")
     print(f"  target:        {meta['total_target']:,} ({meta['num_shards']} shards)")
@@ -245,6 +246,7 @@ def _parse_args() -> Config:
     p.add_argument("--shard-cpu", type=_positive_float, default=d.shard_cpu)
     p.add_argument("--shard-memory-mb", type=_positive_int, default=d.shard_memory_mb)
     p.add_argument("--sandbox-timeout-s", type=_positive_int, default=d.sandbox_timeout_s)
+    p.add_argument("--sandbox-lifetime-s", type=_positive_int, default=d.sandbox_lifetime_s)
     p.add_argument("--shard-timeout-s", type=_positive_int, default=d.shard_timeout_s)
     a = p.parse_args()
     return Config(
@@ -257,6 +259,7 @@ def _parse_args() -> Config:
         shard_cpu=a.shard_cpu,
         shard_memory_mb=a.shard_memory_mb,
         sandbox_timeout_s=a.sandbox_timeout_s,
+        sandbox_lifetime_s=a.sandbox_lifetime_s,
         shard_timeout_s=a.shard_timeout_s,
     )
 
