@@ -1,6 +1,9 @@
 package main
 
 import (
+	"context"
+	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -106,4 +109,76 @@ func TestRateLimiterShape(t *testing.T) {
 				tc.perSecond, burst, period, tc.wantBurst, tc.wantPeriod)
 		}
 	}
+}
+
+func TestParseCountLine(t *testing.T) {
+	for _, tc := range []struct {
+		line, prefix string
+		want         int64
+		ok           bool
+	}{
+		{"#retries 7", "#retries ", 7, true},
+		{"#peak 1250", "#peak ", 1250, true},
+		{"#retries x", "#retries ", 0, false},
+		{"#peak 3", "#retries ", 0, false},
+	} {
+		n, ok := parseCountLine(tc.line, tc.prefix)
+		if ok != tc.ok || n != tc.want {
+			t.Errorf("parseCountLine(%q, %q) = (%d, %v), want (%d, %v)", tc.line, tc.prefix, n, ok, tc.want, tc.ok)
+		}
+	}
+}
+
+func TestBadExitIsNotRetried(t *testing.T) {
+	// runCmd must be able to tell "the command ran and failed" apart from a
+	// transport failure, or it would retry deterministic failures.
+	var exit badExit
+	if !errors.As(error(badExit{code: 3}), &exit) || exit.code != 3 {
+		t.Fatal("badExit is not recoverable via errors.As")
+	}
+	if errors.As(fmt.Errorf("exec: %w", context.DeadlineExceeded), &exit) {
+		t.Error("a transport failure was classified as a bad exit")
+	}
+}
+
+func TestExecBudget(t *testing.T) {
+	// The SDK rejects a fractional Timeout and reads 0 as "no timeout", so the
+	// budget must always be whole seconds and never zero.
+	t.Run("no deadline falls back to the flag", func(t *testing.T) {
+		d, ok := execBudget(context.Background(), 2*time.Minute)
+		if !ok || d != 2*time.Minute {
+			t.Fatalf("got (%v, %v)", d, ok)
+		}
+	})
+
+	t.Run("truncates to whole seconds and never exceeds the budget", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
+		d, ok := execBudget(ctx, 2*time.Minute)
+		if !ok {
+			t.Fatal("budget unexpectedly exhausted")
+		}
+		if d%time.Second != 0 {
+			t.Errorf("timeout %v is not a whole number of seconds", d)
+		}
+		if d <= 0 || d > 2*time.Minute {
+			t.Errorf("timeout %v outside (0, 2m]", d)
+		}
+	})
+
+	t.Run("sub-second remainder gives up rather than sending zero", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 400*time.Millisecond)
+		defer cancel()
+		if d, ok := execBudget(ctx, 2*time.Minute); ok {
+			t.Errorf("got (%v, true), want give-up: zero would mean no timeout", d)
+		}
+	})
+
+	t.Run("expired context gives up", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), -time.Second)
+		defer cancel()
+		if _, ok := execBudget(ctx, 2*time.Minute); ok {
+			t.Error("expired context still yielded a budget")
+		}
+	})
 }
