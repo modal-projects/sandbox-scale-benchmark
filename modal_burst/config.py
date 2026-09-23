@@ -16,6 +16,7 @@ class Config:
     shard_cpu: float = 4.0
     shard_memory_mb: int = 4096
     shard_timeout_s: int = 3600
+    force: bool = False  # skip the pre-flight check against prior runs in results/
 
     @property
     def num_shards(self) -> int:
