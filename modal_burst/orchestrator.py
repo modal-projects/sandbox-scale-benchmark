@@ -18,14 +18,16 @@ import asyncio
 import json
 import os
 import subprocess
+import sys
 import time
+from dataclasses import replace
 from datetime import datetime, timezone
 from typing import Any
 
 import modal
 
 from . import app as appmod
-from ._history import largest_proven_target, load_prior_runs, scale_warning
+from ._history import confirm_total, largest_proven_target, load_prior_runs, scale_warning
 from ._stats import aggregate
 from .app import APP_NAME, SANDBOX_APP_NAME, SHARD_REMOTE, SHARD_SRC, shard_image, worker_env
 from .config import Config
@@ -112,11 +114,12 @@ async def run(cfg: Config) -> None:
         raise SystemExit("no Modal token found (run `modal token new` or set MODAL_TOKEN_ID/SECRET)")
 
     proven = largest_proven_target(load_prior_runs(appmod.REPO_ROOT / "results"))
-    warning = scale_warning(cfg.total, proven)
-    if warning:
-        if not cfg.force:
-            raise SystemExit(f"refusing to run: {warning} (or pass --force)")
-        print(f"WARNING: {warning}")
+    if cfg.force or not sys.stdin.isatty():
+        warning = scale_warning(cfg.total, proven)
+        if warning:
+            print(f"WARNING: {warning}")
+    else:
+        cfg = replace(cfg, total=confirm_total(cfg.total, proven))
 
     _ensure_binary()
     image = shard_image()
@@ -257,7 +260,7 @@ def _parse_args() -> Config:
     p.add_argument(
         "--force",
         action="store_true",
-        help="run even if --total is a large jump over the biggest proven run in results/",
+        help="skip the confirm step when --total is a large jump over the biggest proven run in results/",
     )
     a = p.parse_args()
     return Config(

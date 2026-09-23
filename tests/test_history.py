@@ -1,6 +1,12 @@
 import json
 
-from modal_burst._history import largest_proven_target, load_prior_runs, scale_warning
+from modal_burst._history import (
+    confirm_total,
+    largest_proven_target,
+    load_prior_runs,
+    scale_warning,
+    suggested_total,
+)
 
 
 def _meta(target: int, created: int, shard_errors=()):
@@ -34,4 +40,19 @@ def test_scale_warning():
     assert scale_warning(10_000, None) is not None
     assert scale_warning(10_000, 5000) is None
     assert scale_warning(10_000, 4000) is not None
-    assert "8,000" in scale_warning(10_000, 4000)
+    assert "2.5x" in scale_warning(10_000, 4000)
+
+
+def test_suggested_total():
+    assert suggested_total(400, None) is None
+    assert suggested_total(5500, None) == 500
+    assert suggested_total(5500, 1000) == 2000
+    assert suggested_total(2000, 1000) is None
+
+
+def test_confirm_total():
+    assert confirm_total(2000, 1000, ask=lambda _: "n") == 2000
+    assert confirm_total(5500, 1000, ask=lambda _: "") == 2000
+    assert confirm_total(5500, 1000, ask=lambda _: "Y") == 2000
+    assert confirm_total(5500, 1000, ask=lambda _: "n") == 5500
+    assert confirm_total(5500, None, ask=lambda _: "y") == 500

@@ -64,10 +64,19 @@ remain available for the shard sandboxes.
 uv run python -m modal_burst.orchestrator --total 10000 --shard-size 5000
 ```
 
-The orchestrator refuses a `--total` more than 2x the largest prior run under
-`results/` that completed cleanly (no shard errors, at least 90% of sandboxes
-created), or any `--total` above 500 when there is no prior run. Step up
-gradually (e.g. 500 → 1000 → 2000 → 4000 → 8000), or pass `--force` to run anyway.
+If `--total` is more than 2x the largest prior run under `results/` that
+completed cleanly (no shard errors, at least 90% of sandboxes created) — or
+above 500 when there is no prior run — the orchestrator asks you to confirm a
+reduced load before proceeding:
+
+```
+previous proven run was 1,000 (>=90% created); proposed test is 5,500 (5.5x previous)
+Proposing load be set at 2,000. Accept? [Y/n]
+```
+
+`Y` runs at the reduced load; `n` proceeds at the requested `--total` with a
+warning. `--force` (or a non-interactive stdin) skips the prompt and runs the
+requested total. `results/` is gitignored, so this history is per checkout.
 
 Per-shard concurrency is approximately `clients × HTTP/2 streams per
 connection`. By default the Go shard uses about `shard_size/100` clients;
@@ -87,7 +96,7 @@ container limits.
 | `--shard-cpu` / `--shard-memory-mb` | `4.0` / `4096` | shard sandbox resources |
 | `--sandbox-timeout-s` | `3600` | inner-sandbox lifetime |
 | `--shard-timeout-s` | `3600` | shard-sandbox lifetime and exec timeout |
-| `--force` | off | skip the pre-flight check against prior runs in `results/` |
+| `--force` | off | skip the confirm step against prior runs in `results/` |
 
 Inner sandboxes use Modal's default resources. Numeric arguments reject negative
 values, and sizes and timeouts must be greater than zero.

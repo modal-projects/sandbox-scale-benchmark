@@ -2,8 +2,9 @@
 
 Jumping straight to a large target without first proving a smaller one tends to
 burn a lot of capacity discovering a limit that a cheaper run would have found.
-The check reads every ``results/<run_id>/meta.json`` and refuses a target that
-is more than ``MAX_STEP_FACTOR`` times the largest run that completed cleanly.
+The check reads every ``results/<run_id>/meta.json`` and, for a target more
+than ``MAX_STEP_FACTOR`` times the largest run that completed cleanly, asks the
+operator to confirm a reduced load before proceeding.
 """
 
 from __future__ import annotations
@@ -47,20 +48,38 @@ def largest_proven_target(runs: list[dict[str, Any]]) -> Optional[int]:
     return best
 
 
+def suggested_total(total: int, proven: Optional[int]) -> Optional[int]:
+    """Return a safer load to propose instead of ``total``, or None if ``total`` is fine."""
+    limit = NO_HISTORY_MAX if proven is None else proven * MAX_STEP_FACTOR
+    return None if total <= limit else limit
+
+
 def scale_warning(total: int, proven: Optional[int]) -> Optional[str]:
     """Return a message if ``total`` is too big a jump from ``proven``, else None."""
-    if proven is None:
-        if total <= NO_HISTORY_MAX:
-            return None
-        return (
-            f"no proven prior run found under results/ but --total is {total:,}; "
-            f"run something smaller first (e.g. --total {NO_HISTORY_MAX}) before scaling up"
-        )
-    limit = proven * MAX_STEP_FACTOR
-    if total <= limit:
+    suggestion = suggested_total(total, proven)
+    if suggestion is None:
         return None
+    if proven is None:
+        return (
+            f"no proven prior run found under results/; proposed test is {total:,} "
+            f"(max {NO_HISTORY_MAX:,} without history)"
+        )
     return (
-        f"--total {total:,} is more than {MAX_STEP_FACTOR}x the largest proven run "
-        f"({proven:,} target, >={MIN_SUCCESS_RATIO:.0%} created); "
-        f"try --total {limit:,} or less first"
+        f"previous proven run was {proven:,} (>={MIN_SUCCESS_RATIO:.0%} created); "
+        f"proposed test is {total:,} ({total / proven:.1f}x previous)"
     )
+
+
+def confirm_total(total: int, proven: Optional[int], ask=input) -> int:
+    """Interactive confirm step: propose a reduced load and return the total to run."""
+    suggestion = suggested_total(total, proven)
+    if suggestion is None:
+        return total
+    print(scale_warning(total, proven))
+    answer = ask(f"Proposing load be set at {suggestion:,}. Accept? [Y/n] ").strip().lower()
+    if answer in ("", "y", "yes"):
+        print(f"Running test at {suggestion:,}...")
+        return suggestion
+    reason = f"{total / proven:.1f}x previous test" if proven else "no proven prior run"
+    print(f"Load reduction rejected. Proceeding with {total:,} (WARN: {reason})...")
+    return total
