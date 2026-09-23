@@ -66,8 +66,8 @@ uv run python -m modal_burst.orchestrator --total 10000 --shard-size 5000
 
 The orchestrator refuses a `--total` more than 2x the largest prior run under
 `results/` that completed cleanly (no shard errors, at least 90% of sandboxes
-created), or any `--total` above 1000 when there is no prior run. Step up
-gradually (e.g. 1000 → 2000 → 5000 → 10000), or pass `--force` to run anyway.
+created), or any `--total` above 500 when there is no prior run. Step up
+gradually (e.g. 500 → 1000 → 2000 → 4000 → 8000), or pass `--force` to run anyway.
 
 Per-shard concurrency is approximately `clients × HTTP/2 streams per
 connection`. By default the Go shard uses about `shard_size/100` clients;

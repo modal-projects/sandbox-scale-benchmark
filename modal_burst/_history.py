@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 MAX_STEP_FACTOR = 2
+NO_HISTORY_MAX = 500  # largest --total allowed before any run has been proven
 MIN_SUCCESS_RATIO = 0.9  # created / target for a run to count as proven
 
 
@@ -49,11 +50,11 @@ def largest_proven_target(runs: list[dict[str, Any]]) -> Optional[int]:
 def scale_warning(total: int, proven: Optional[int]) -> Optional[str]:
     """Return a message if ``total`` is too big a jump from ``proven``, else None."""
     if proven is None:
-        if total <= 1000:
+        if total <= NO_HISTORY_MAX:
             return None
         return (
             f"no proven prior run found under results/ but --total is {total:,}; "
-            f"run something smaller first (e.g. --total 1000) before scaling up"
+            f"run something smaller first (e.g. --total {NO_HISTORY_MAX}) before scaling up"
         )
     limit = proven * MAX_STEP_FACTOR
     if total <= limit:

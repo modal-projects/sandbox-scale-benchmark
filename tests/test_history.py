@@ -30,6 +30,7 @@ def test_largest_proven_target_requires_clean_run():
 
 def test_scale_warning():
     assert scale_warning(500, None) is None
+    assert scale_warning(501, None) is not None
     assert scale_warning(10_000, None) is not None
     assert scale_warning(10_000, 5000) is None
     assert scale_warning(10_000, 4000) is not None
