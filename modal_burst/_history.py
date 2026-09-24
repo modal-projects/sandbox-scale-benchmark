@@ -1,8 +1,6 @@
-"""Pre-flight scale check against prior runs in ``results/``.
-
-Reads every ``results/<run_id>/meta.json``, finds the largest run that completed
-cleanly, and asks for confirmation before running more than ``MAX_STEP_FACTOR``x
-that. ``results/`` is gitignored, so the history is per checkout.
+"""This runs against the previous results under `results/<run_id>/meta.json`.
+It finds the largest run that completed cleanly and asks for confirmation before
+running too high of a load.
 """
 
 from __future__ import annotations
