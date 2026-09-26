@@ -4,11 +4,114 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 )
+
+func TestHistoryRoundTrip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "nested", "history.jsonl")
+	if runs, err := loadHistory(path); err != nil || runs != nil {
+		t.Fatalf("missing file = (%v, %v), want empty history", runs, err)
+	}
+	now := time.Now().UTC().Truncate(time.Second)
+	for _, r := range []runRecord{
+		{Time: now, Total: 1000, Ready: 1000},
+		{Time: now, Total: 2000, Ready: 1500},
+	} {
+		if err := appendHistory(path, r); err != nil {
+			t.Fatal(err)
+		}
+	}
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.WriteString("not json\n") //nolint:errcheck
+	f.Close()                   //nolint:errcheck
+
+	runs, err := loadHistory(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(runs) != 2 || runs[0].Total != 1000 || !runs[0].Time.Equal(now) || runs[1].Ready != 1500 {
+		t.Errorf("runs = %+v", runs)
+	}
+}
+
+func TestLargestCleanTotal(t *testing.T) {
+	now := time.Now()
+	recent := now.Add(-time.Hour)
+	runs := []runRecord{
+		{Time: recent, Total: 1000, Ready: 1000},
+		{Time: recent, Total: 2000, Ready: 1900}, // 95% ready: clean
+		{Time: recent, Total: 5000, Ready: 4000}, // 80% ready: not clean
+		{Time: recent, Total: 6000, Ready: 6000, FailedShards: 1},
+		{Time: recent, Total: 7000, Ready: 7000, Interrupted: true},
+		{Time: now.Add(-historyWindow - time.Hour), Total: 9000, Ready: 9000}, // too old
+	}
+	if got := largestCleanTotal(runs, now); got != 2000 {
+		t.Errorf("largest clean = %d, want 2000", got)
+	}
+	if got := largestCleanTotal(nil, now); got != 0 {
+		t.Errorf("empty history = %d, want 0", got)
+	}
+}
+
+func TestPreflightTotal(t *testing.T) {
+	for _, tc := range []struct {
+		name               string
+		total, proven      int
+		interactive, force bool
+		input              string
+		want               int
+	}{
+		{"within step", 2000, 1000, true, false, "", 2000},
+		{"within no-history max", 500, 0, true, false, "", 500},
+		{"enter accepts reduction", 5500, 1000, true, false, "\n", 2000},
+		{"Y accepts reduction", 5500, 1000, true, false, "Y\n", 2000},
+		{"n keeps proposed load", 5500, 1000, true, false, "n\n", 5500},
+		{"reprompts on junk", 5500, 1000, true, false, "maybe\nno\n", 5500},
+		{"EOF accepts reduction", 5500, 1000, true, false, "", 2000},
+		{"no history reduces to base", 5500, 0, true, false, "y\n", noHistoryMax},
+		{"non-interactive reduces", 5500, 1000, false, false, "", 2000},
+		{"force keeps proposed load", 5500, 1000, false, true, "", 5500},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := preflightTotal(tc.total, tc.proven, tc.interactive, tc.force, strings.NewReader(tc.input), io.Discard)
+			if got != tc.want {
+				t.Errorf("got %d, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestPreflightTotalMessage(t *testing.T) {
+	var out strings.Builder
+	preflightTotal(5500, 1000, true, false, strings.NewReader("n\n"), &out)
+	for _, want := range []string{
+		"was 1,000. Proposed test is 5,500 (5.5x previous test)",
+		"Proposing load be set at 2,000. Accept? [Y/n]",
+		"Proceeding with 5,500 (WARN: 5.5x previous test)",
+	} {
+		if !strings.Contains(out.String(), want) {
+			t.Errorf("output missing %q:\n%s", want, out.String())
+		}
+	}
+}
+
+func TestCommas(t *testing.T) {
+	for n, want := range map[int]string{0: "0", 999: "999", 1000: "1,000", 123456: "123,456", 1234567: "1,234,567", -1000: "-1,000", -100: "-100"} {
+		if got := commas(n); got != want {
+			t.Errorf("commas(%d) = %q, want %q", n, got, want)
+		}
+	}
+}
 
 func TestRecordMinMax(t *testing.T) {
 	var lo, hi atomic.Int64
