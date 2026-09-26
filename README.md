@@ -1,14 +1,16 @@
 # modal-burst
 
 A burst benchmark for [Modal](https://modal.com) sandboxes. It creates a target
-number of sandboxes and builds SQLite from source in each one.
+number of sandboxes, runs a short shell workload in each one, and holds each
+sandbox up for a fixed lifetime so the run reaches a concurrency plateau.
 
 It measures two spans on a common wall clock:
 
 - **Time to complete creates** — earliest inner-sandbox create start to the last
   shard completing its create attempts.
-- **Time to complete builds** — earliest SQLite build start to the last shard
-  completing its builds.
+- **Time to complete builds** — earliest workload start to the last shard
+  completing its workloads. The lifetime hold happens after this span, so it
+  does not inflate the number.
 
 ## Architecture
 
@@ -23,13 +25,15 @@ uv run python -m modal_burst.orchestrator           (local Python)
 each shard sandbox (Go, shard-go/main.go):
   pool of `clients` Modal clients
   create shard_size inner sandboxes concurrently
-  build SQLite in each successful sandbox and tear it down when done
+  run the workload in each successful sandbox, hold it for the rest of its
+    lifetime, then tear it down
   print one JSON line of results
 ```
 
-The inner image and pinned SQLite source are defined in `shard-go/main.go`.
-`shard-go/workload.sh` is embedded in the Go binary and runs `make testfixture`
-as an unprivileged user.
+The inner image is the stock `debian:bookworm-slim`, pinned in
+`shard-go/main.go`. `shard-go/workload.sh` is embedded in the Go binary; it
+reads two files and checksums one of them, so it finishes in milliseconds and
+needs nothing installed in the image.
 
 By default, each sandbox starts building as soon as its own create call returns.
 `--wait-for-shard-creates` instead waits for every create call in a shard before
@@ -54,8 +58,7 @@ uv sync
 uv run python -m modal_burst.orchestrator --total 100 --shard-size 100
 ```
 
-The first run builds the inner SQLite image; Modal caches it for later runs. Run
-the orchestrator as a plain script rather than with `modal run` so the Apps
+Run the orchestrator as a plain script rather than with `modal run` so the Apps
 remain available for the shard sandboxes.
 
 ## Scaling up
@@ -80,20 +83,29 @@ container limits.
 | `--clients` | `0` | Go client pool per shard; `0` selects about one client per 100 sandboxes |
 | `--wait-for-shard-creates` | off | wait for all creates in each shard before starting that shard's builds |
 | `--shard-cpu` / `--shard-memory-mb` | `4.0` / `4096` | shard sandbox resources |
-| `--sandbox-timeout-s` | `3600` | inner-sandbox lifetime |
+| `--sandbox-lifetime-s` | `300` | how long a shard holds each inner sandbox up before terminating it |
+| `--sandbox-timeout-s` | `3600` | inner-sandbox hard cap enforced by Modal; the backstop if a shard dies |
 | `--shard-timeout-s` | `3600` | shard-sandbox lifetime and exec timeout |
 
 Inner sandboxes use Modal's default resources. Numeric arguments reject negative
 values, and sizes and timeouts must be greater than zero.
 
+`--sandbox-timeout-s` is the only thing that reaps inner sandboxes if a shard
+crashes mid-run, so keep it close to `--sandbox-lifetime-s`. Leaving it at the
+`3600` default while running a 5-minute lifetime means a dead shard leaks its
+sandboxes for an hour.
+
 ## Results
 
 Each run writes `results/<run_id>/meta.json` and `raw.jsonl`. The aggregate
-contains create/build spans, build timing distributions, status counts, and
-grouped failure reasons. Each JSONL row contains `sandbox_idx`, `shard_index`,
-`status`, `sandbox_id`, `create_ms`, `build_ms`, and `error`.
+contains create/workload spans, workload timing distributions, status counts,
+and grouped failure reasons. Each JSONL row contains `sandbox_idx`,
+`shard_index`, `status`, `sandbox_id`, `create_ms`, `build_ms`, and `error`.
 
-Build and exec-start failures are recorded as their own benchmark outcomes.
+`build_ms` and the `build_failed` status keep their names from when the workload
+was a SQLite build; they now mean workload duration and workload failure.
+
+Workload and exec-start failures are recorded as their own benchmark outcomes.
 
 ## Operational notes
 
@@ -105,8 +117,7 @@ Build and exec-start failures are recorded as their own benchmark outcomes.
 - Modal credentials are forwarded to shard sandboxes through environment
   variables so each Go client can create inner sandboxes. Only run this in an
   environment where those sandboxes are trusted.
-- The SQLite source URL and directory are pinned in `shard-go/main.go`. Update
-  both constants together when changing the workload version.
+- The inner image tag is pinned as `innerImageTag` in `shard-go/main.go`.
 
 ## Layout
 
@@ -119,7 +130,7 @@ modal_burst/
   _results.py      status taxonomy
 shard-go/
   main.go          inner-sandbox creation and build orchestration
-  workload.sh      embedded SQLite build workload
+  workload.sh      embedded shell workload
 tests/
   test_stats.py
 ```

@@ -12,7 +12,8 @@ class Config:
     ramp_s: float = 0.0  # spread a shard's creates over this many seconds; 0 = all at once
     clients: int = 0  # Go client/connection pool per shard; 0 = auto (~size/100)
     wait_for_shard_creates: bool = False
-    sandbox_timeout_s: int = 3600  # inner-sandbox lifetime; the backstop for a running workload
+    sandbox_timeout_s: int = 3600  # inner-sandbox hard cap, enforced by Modal; backstop if a shard dies
+    sandbox_lifetime_s: int = 300  # how long a shard holds each inner sandbox up before terminating it
     shard_cpu: float = 4.0
     shard_memory_mb: int = 4096
     shard_timeout_s: int = 3600

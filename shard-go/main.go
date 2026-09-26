@@ -20,20 +20,9 @@ import (
 //go:embed workload.sh
 var workloadScript string
 
-const (
-	sqliteSrcURL = "https://sqlite.org/2026/sqlite-src-3530200.zip"
-	sqliteDir    = "sqlite-src-3530200"
-)
-
-// Image for the inner sandboxes: Debian + build toolchain + TCL, with the SQLite
-// source fetched and ./configure'd (but NOT built — each sandbox compiles fresh).
-var sqliteSetup = []string{
-	"RUN apt-get update && apt-get install -y --no-install-recommends " +
-		"build-essential tcl-dev zlib1g-dev curl unzip ca-certificates && rm -rf /var/lib/apt/lists/*",
-	"RUN curl -fsSL -o /tmp/src.zip " + sqliteSrcURL +
-		" && cd /tmp && unzip -q src.zip && mv " + sqliteDir + " /sqlite && cd /sqlite && ./configure >/dev/null",
-	"RUN useradd -m tester && chown -R tester:tester /sqlite",
-}
+// The workload is a handful of shell commands, so the inner sandboxes run the
+// stock base image with no extra layers to build or cache.
+const innerImageTag = "debian:bookworm-slim"
 
 type result struct {
 	Status    string  `json:"status"` // success | build_failed | create_failed | workload_error
@@ -105,6 +94,7 @@ func main() {
 	group := envInt("GROUP_SIZE", 50)
 	rampMs := envInt("RAMP_MS", 0)
 	sbTimeout := time.Duration(envInt("SANDBOX_TIMEOUT_S", 3600)) * time.Second
+	lifetime := time.Duration(envInt("SANDBOX_LIFETIME_S", 300)) * time.Second
 	waitForShardCreates := envInt("WAIT_FOR_SHARD_CREATES", 0) != 0
 	appName := env("SANDBOX_APP_NAME", "modal-burst-sandboxes")
 
@@ -119,7 +109,7 @@ func main() {
 		clients = size
 	}
 
-	// Build the client/connection pool and the (cached) SQLite image — all
+	// Build the client/connection pool and resolve the (cached) inner image — all
 	// before the clock starts, so create/workload timings exclude one-time
 	// auth + imageget.
 	pool := make([]pooledClient, clients)
@@ -139,9 +129,7 @@ func main() {
 				setupErrs[i] = fmt.Errorf("Apps.FromName: %w", err)
 				return
 			}
-			image, err := mc.Images.FromRegistry("debian:bookworm-slim", nil).
-				DockerfileCommands(sqliteSetup, nil).
-				Build(ctx, app, nil)
+			image, err := mc.Images.FromRegistry(innerImageTag, nil).Build(ctx, app, nil)
 			if err != nil {
 				setupErrs[i] = fmt.Errorf("Image.Build: %w", err)
 				return
@@ -170,6 +158,7 @@ func main() {
 
 	sandboxes := make([]*modal.Sandbox, size)
 	createMs := make([]int, size)
+	createdAt := make([]time.Time, size)
 	results := make([]result, size)
 	buildStarts := make([]time.Time, size)
 	buildDones := make([]time.Time, size)
@@ -185,6 +174,10 @@ func main() {
 			sid := sb.SandboxID
 			r.SandboxID = &sid
 			results[idx] = r
+			// Keep the sandbox up for the rest of its lifetime. The workload is
+			// much shorter, so without this the run measures create throughput
+			// and never reaches a concurrency plateau.
+			time.Sleep(time.Until(createdAt[idx].Add(lifetime)))
 			sb.Terminate(ctx, nil)
 		}()
 	}
@@ -212,6 +205,7 @@ func main() {
 				return
 			}
 			sandboxes[idx] = sb
+			createdAt[idx] = time.Now()
 			if !waitForShardCreates {
 				startBuild(idx, sb)
 			}
