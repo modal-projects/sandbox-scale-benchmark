@@ -45,6 +45,11 @@
 // The driver derives the same tag from its own binary, so an Image built from
 // a different build is a lookup failure rather than a stale benchmark.
 //
+// Every run appends a record to -history. Before a run, if -total is more than
+// 2x the largest clean run of the last 7 days (or above 500 with no run),
+// burst asks before running: y runs the requested -total, and n or Enter
+// aborts. Use -force to skip the check.
+//
 // When doing large runs, please let someone at Modal know.
 package main
 
@@ -53,6 +58,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -102,6 +108,8 @@ var (
 	printImageRef = flag.Bool("print-image-ref", false, "print the runner Image ref this binary needs, and the binary's path, then exit")
 	runnerCPU     = flag.Float64("runner-cpu", 4, "CPU cores per -shards runner Sandbox")
 	runnerMemory  = flag.Int("runner-memory", 4096, "MiB of memory per -shards runner Sandbox")
+	historyPath   = flag.String("history", defaultHistoryPath(), "JSONL file of past runs, used to check -total against the largest recent clean run")
+	force         = flag.Bool("force", false, "skip the confirm step when -total is a large jump over the largest recent clean run")
 )
 
 var (
@@ -168,6 +176,16 @@ func (f *failureCounts) addCount(reason string, n int) {
 		f.counts = map[string]int{}
 	}
 	f.counts[reason] += n
+}
+
+func (f *failureCounts) total() int64 {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var n int64
+	for _, c := range f.counts {
+		n += int64(c)
+	}
+	return n
 }
 
 func (f *failureCounts) report(emitRaw bool) {
@@ -357,6 +375,7 @@ type aggregateDurations struct {
 	winCreate atomic.Int64
 	missed    atomic.Int64
 	retries   atomic.Int64
+	ready     atomic.Int64
 }
 
 func (a *aggregateDurations) add(op string, batch []time.Duration) {
@@ -601,6 +620,174 @@ func session(ctx context.Context, mc *modal.Client, app *modal.App, image *modal
 	return nil
 }
 
+// Pre-flight scale check: a run whose -total is far past anything that has
+// recently run cleanly must be confirmed, so a typo or an over-eager ramp does
+// not land a surprise burst on Modal.
+const (
+	maxStepFactor     = 2
+	noHistoryMax      = 500 // largest -total allowed without a clean recent run
+	minReadyRatio     = 0.9 // ready/total needed for a run to count as clean
+	historyWindowDays = 7
+	historyWindow     = historyWindowDays * 24 * time.Hour
+)
+
+// runRecord is one line of -history, written by the driver after each run.
+type runRecord struct {
+	Time         time.Time `json:"time"`
+	Total        int       `json:"total"`
+	Shards       int       `json:"shards"`
+	Created      int64     `json:"created"`
+	Ready        int64     `json:"ready"`
+	Failed       int64     `json:"failed"`
+	FailedShards int64     `json:"failed_shards"`
+	Interrupted  bool      `json:"interrupted"`
+}
+
+func (r runRecord) clean() bool {
+	return r.Total > 0 && !r.Interrupted && r.FailedShards == 0 &&
+		float64(r.Ready) >= minReadyRatio*float64(r.Total)
+}
+
+// defaultHistoryPath lives in the user's config dir rather than the working
+// directory, so the check follows the operator across checkouts and `go run`.
+func defaultHistoryPath() string {
+	dir, err := os.UserConfigDir()
+	if err != nil {
+		return "burst-history.jsonl"
+	}
+	return filepath.Join(dir, "modal-burst", "burst-history.jsonl")
+}
+
+// loadHistory reads every parseable record in path. A missing file is an
+// empty history; malformed lines are skipped.
+func loadHistory(path string) ([]runRecord, error) {
+	f, err := os.Open(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close() //nolint:errcheck // read-only
+	var runs []runRecord
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		var r runRecord
+		if json.Unmarshal(scanner.Bytes(), &r) == nil {
+			runs = append(runs, r)
+		}
+	}
+	return runs, scanner.Err()
+}
+
+func appendHistory(path string, r runRecord) error {
+	line, err := json.Marshal(r)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(append(line, '\n')); err != nil {
+		f.Close() //nolint:errcheck // the write error is the one worth reporting
+		return err
+	}
+	return f.Close()
+}
+
+// largestCleanTotal is the biggest -total that ran cleanly within
+// historyWindow of now, or 0 if none did.
+func largestCleanTotal(runs []runRecord, now time.Time) int {
+	best := 0
+	for _, r := range runs {
+		if r.clean() && now.Sub(r.Time) <= historyWindow && r.Total > best {
+			best = r.Total
+		}
+	}
+	return best
+}
+
+// stepLimit is the largest -total that runs without confirmation.
+func stepLimit(proven int) int {
+	if proven <= 0 {
+		return noHistoryMax
+	}
+	return proven * maxStepFactor
+}
+
+// preflightConfirm reports whether a run of total may go ahead. Above
+// stepLimit it asks; anything but an explicit yes aborts, so an operator who
+// just presses Enter, or a script with no terminal, does not launch the burst.
+func preflightConfirm(total, proven int, interactive, force bool, in io.Reader, out io.Writer) bool {
+	limit := stepLimit(proven)
+	if total <= limit {
+		return true
+	}
+	var reason string
+	if proven > 0 {
+		reason = fmt.Sprintf("%.1fx previous test", float64(total)/float64(proven))
+		fmt.Fprintf(out, "Largest clean load test in the last %d days was %s. Proposed test is %s (%s); up to %s runs without confirmation.\n",
+			historyWindowDays, commas(proven), commas(total), reason, commas(limit))
+	} else {
+		reason = "no clean previous test"
+		fmt.Fprintf(out, "No clean load test in the last %d days. Proposed test is %s; up to %s runs without confirmation.\n",
+			historyWindowDays, commas(total), commas(limit))
+	}
+	switch {
+	case force:
+		fmt.Fprintf(out, "-force set. Proceeding with %s (WARN: %s)...\n", commas(total), reason)
+		return true
+	case !interactive:
+		fmt.Fprintf(out, "Aborted: stdin is not a terminal. Pass -force to run %s, or lower -total to %s.\n",
+			commas(total), commas(limit))
+		return false
+	}
+	scanner := bufio.NewScanner(in)
+	for {
+		fmt.Fprintf(out, "Run with -total %s anyway? [y/N] ", commas(total))
+		answer := ""
+		if scanner.Scan() {
+			answer = strings.ToLower(strings.TrimSpace(scanner.Text()))
+		} else {
+			fmt.Fprintln(out)
+		}
+		switch answer {
+		case "y", "yes":
+			fmt.Fprintf(out, "Proceeding with %s (WARN: %s)...\n", commas(total), reason)
+			return true
+		case "", "n", "no":
+			fmt.Fprintf(out, "Aborted. Lower -total to %s to run without confirmation.\n", commas(limit))
+			return false
+		}
+	}
+}
+
+// recordRun appends r to -history. A write failure only costs the next run its
+// baseline, so it is logged rather than fatal.
+func recordRun(r runRecord) {
+	if err := appendHistory(*historyPath, r); err != nil {
+		log.Printf("warning: record run in -history %s: %v", *historyPath, err)
+	}
+}
+
+func stdinIsTerminal() bool {
+	fi, err := os.Stdin.Stat()
+	return err == nil && fi.Mode()&os.ModeCharDevice != 0
+}
+
+// commas formats n with thousands separators, e.g. 5500 as "5,500".
+func commas(n int) string {
+	s := strconv.Itoa(n)
+	for i := len(s) - 3; i > 0 && s[i-1] != '-'; i -= 3 {
+		s = s[:i] + "," + s[i:]
+	}
+	return s
+}
+
 // ownBinaryTag is the SHA-256 prefix of the running binary, used as the runner
 // Image tag so the driver and its runners always execute identical code.
 func ownBinaryTag() (string, error) {
@@ -763,6 +950,10 @@ func runShard(ctx context.Context, mc *modal.Client, app *modal.App, runner *mod
 					agg.retries.Add(n)
 					continue
 				}
+				if n, ok := parseCountLine(line, "#ready "); ok {
+					agg.ready.Add(n)
+					continue
+				}
 				fmt.Printf("[shard %d] %s\n", idx, line)
 			}
 		}()
@@ -783,8 +974,9 @@ func runShard(ctx context.Context, mc *modal.Client, app *modal.App, runner *mod
 // the first Exec on a Sandbox fetches a per-task command-router URL and dials
 // it, so every Sandbox costs one DNS lookup plus one TLS handshake, and that
 // connection stays open until the Sandbox is terminated. Runners each bring
-// their own resolver, connection budget, and NIC.
-func runShards(ctx context.Context, mc *modal.Client, app *modal.App, runner *modal.Image) {
+// their own resolver, connection budget, and NIC. It returns the combined
+// results and how many shards failed.
+func runShards(ctx context.Context, mc *modal.Client, app *modal.App, runner *modal.Image) (*aggregateDurations, int64) {
 	env, err := shardEnv()
 	if err != nil {
 		log.Fatalf("collect credentials for runners: %v", err)
@@ -837,6 +1029,7 @@ func runShards(ctx context.Context, mc *modal.Client, app *modal.App, runner *mo
 	wg.Wait()
 	log.Printf("all %d shards finished in %s (%d failed)", *shards, time.Since(start).Round(time.Second), failedShards.Load())
 	agg.report()
+	return agg, failedShards.Load()
 }
 
 func main() {
@@ -858,6 +1051,10 @@ Examples:
 
 With -shards, the runner image must ship CA certificates or the runners cannot
 reach Modal. alpine:3.21 does; debian:bookworm-slim does not.
+
+Each run is appended to -history. If -total is more than 2x the largest clean
+run of the last 7 days (or above 500 with none), burst asks before running:
+y runs the requested -total, n or Enter aborts. -force skips the check.
 
 Flags:
 
@@ -883,6 +1080,17 @@ Flags:
 		cmd = os.Getenv("BURST_CMD")
 	}
 	isShard := os.Getenv("BURST_SHARD") != ""
+
+	// Runners execute a slice of a run the driver already checked.
+	if !isShard {
+		runs, err := loadHistory(*historyPath)
+		if err != nil {
+			log.Fatalf("read -history %s: %v", *historyPath, err)
+		}
+		if !preflightConfirm(*total, largestCleanTotal(runs, time.Now()), stdinIsTerminal(), *force, os.Stdin, os.Stderr) {
+			os.Exit(1)
+		}
+	}
 
 	if *concurrency == 0 {
 		// A session occupies a worker for -lifetime plus create and exec, so by
@@ -966,7 +1174,18 @@ Flags:
 				"    uv run python build_runner_image.py <path to this binary>", ref, err)
 		}
 		log.Printf("runners will boot Image %s", ref)
-		runShards(ctx, mc, app, runner)
+		runStart := time.Now()
+		agg, failedShards := runShards(ctx, mc, app, runner)
+		recordRun(runRecord{
+			Time:         runStart,
+			Total:        *total,
+			Shards:       *shards,
+			Created:      agg.winCreate.Load(),
+			Ready:        agg.ready.Load(),
+			Failed:       agg.fails.total(),
+			FailedShards: failedShards,
+			Interrupted:  ctx.Err() != nil,
+		})
 		return
 	}
 
@@ -1046,10 +1265,19 @@ Flags:
 			fmt.Printf("#missed 1\n")
 		}
 		fmt.Printf("#retries %d\n", execRetries.Load())
+		fmt.Printf("#ready %d\n", ready.Load())
 		m.report(true)
 		fails.report(true)
 		return
 	}
+	recordRun(runRecord{
+		Time:        start,
+		Total:       *total,
+		Created:     created.Load(),
+		Ready:       ready.Load(),
+		Failed:      failures.Load(),
+		Interrupted: ctx.Err() != nil,
+	})
 	createSpan, sustained := createWindow()
 	fmt.Printf("\ncreated %d Sandboxes in %s of creates (%.0f/s sustained), peak %d live, %d ready, %d failed, %d exec retries\n",
 		created.Load(), createSpan.Round(time.Millisecond), sustained,
