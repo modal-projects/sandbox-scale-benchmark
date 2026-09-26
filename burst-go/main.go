@@ -53,6 +53,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -95,6 +96,7 @@ var (
 	appName       = flag.String("app", "sandbox-burst-load-test", "Modal App name to create Sandboxes in")
 	shards        = flag.Int("shards", 0, "spread the run across this many runner Sandboxes on Modal (0 = run directly from this machine)")
 	progressEvery = flag.Duration("progress", 2*time.Second, "how often to print a progress line; rates are measured over this window")
+	execTimeout   = flag.Duration("exec-timeout", 2*time.Minute, "give up on a Sandbox whose workload has not finished in this long")
 	startAt       = flag.Int64("start-at", 0, "unix nanos at which to begin creating (set by the -shards driver; 0 = start immediately)")
 	startDelay    = flag.Duration("start-delay", 45*time.Second, "with -shards, how long runners get to boot before every shard starts creating at once; 0 disables the barrier")
 	printImageRef = flag.Bool("print-image-ref", false, "print the runner Image ref this binary needs, and the binary's path, then exit")
@@ -110,8 +112,10 @@ var (
 	created  atomic.Int64
 	ready    atomic.Int64
 	failures atomic.Int64
-	live     atomic.Int64
-	peakLive atomic.Int64
+	// Transport failures that a second attempt recovered from.
+	execRetries atomic.Int64
+	live        atomic.Int64
+	peakLive    atomic.Int64
 
 	// Bounds of the create phase, as Unix nanos. Sustained create rate is
 	// measured over this window, not over total elapsed time, which would be
@@ -130,8 +134,6 @@ var (
 // timeoutMargin is added to -lifetime for the Sandbox's own Timeout, so the
 // platform reaps a Sandbox whose session died without terminating it.
 const timeoutMargin = 5 * time.Minute
-
-const slowThreshold = 5 * time.Second
 
 // Modal object IDs make otherwise-identical failures unique; strip them so the
 // same kind of failure groups together.
@@ -327,17 +329,20 @@ func parseWindowLine(line string) (first, last, n int64, ok bool) {
 	return first, last, n, true
 }
 
-// parsePeakLine parses "#peak <n>".
-func parsePeakLine(line string) (int64, bool) {
-	if !strings.HasPrefix(line, "#peak ") {
+// parseCountLine parses a "<prefix><n>" line, such as "#peak 1250".
+func parseCountLine(line, prefix string) (int64, bool) {
+	if !strings.HasPrefix(line, prefix) {
 		return 0, false
 	}
-	n, err := strconv.ParseInt(strings.TrimSpace(strings.TrimPrefix(line, "#peak ")), 10, 64)
+	n, err := strconv.ParseInt(strings.TrimSpace(strings.TrimPrefix(line, prefix)), 10, 64)
 	if err != nil {
 		return 0, false
 	}
 	return n, true
 }
+
+// parsePeakLine parses "#peak <n>".
+func parsePeakLine(line string) (int64, bool) { return parseCountLine(line, "#peak ") }
 
 // aggregateDurations merges every shard's raw samples so the driver can compute
 // true percentiles over the combined distribution.
@@ -351,6 +356,7 @@ type aggregateDurations struct {
 	winLast   atomic.Int64
 	winCreate atomic.Int64
 	missed    atomic.Int64
+	retries   atomic.Int64
 }
 
 func (a *aggregateDurations) add(op string, batch []time.Duration) {
@@ -387,6 +393,9 @@ func (a *aggregateDurations) report() {
 	// is an upper bound on true global peak concurrency, not a measurement.
 	fmt.Printf("peak live Sandboxes (sum of %d shard peaks, upper bound): %d\n",
 		a.shardsIn.Load(), a.peakSum.Load())
+	if r := a.retries.Load(); r > 0 {
+		fmt.Printf("exec retries (transport failures a second attempt recovered): %d\n", r)
+	}
 	merged := &metrics{durations: byOp}
 	merged.report(false)
 	a.fails.report(false)
@@ -449,21 +458,93 @@ func sleepUntil(ctx context.Context, t time.Time) {
 	}
 }
 
-// runCmd executes a shell command in the Sandbox and checks its exit code. It
-// never reads stdout, so the SDK's lazy output streams are never opened.
-func runCmd(ctx context.Context, sb *modal.Sandbox, cmd string) error {
-	proc, err := sb.Exec(ctx, []string{"sh", "-c", cmd}, nil)
+// terminate tears a Sandbox down on a deadline of its own. context.WithoutCancel
+// keeps cleanup running after an interrupt, but it also drops the parent's
+// deadline, so without this a hung Terminate would pin the session goroutine.
+func terminate(ctx context.Context, sb *modal.Sandbox) {
+	tctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 60*time.Second)
+	defer cancel()
+	sb.Terminate(tctx, nil) //nolint:errcheck // best-effort cleanup
+}
+
+const execRetryBackoff = time.Second
+
+// badExit is a command that ran and returned non-zero. It is kept distinct from
+// transport failures because retrying it would just fail the same way.
+type badExit struct{ code int }
+
+func (e badExit) Error() string { return fmt.Sprintf("command exited with code %d", e.code) }
+
+// runCmd executes a shell command in the Sandbox and checks its exit code,
+// retrying a transport failure once. Both attempts share one -exec-timeout
+// budget, so a stuck Sandbox still gives up on schedule rather than doubling.
+func runCmd(ctx context.Context, sb *modal.Sandbox, cmd string, timeout time.Duration) error {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	err := execOnce(ctx, sb, cmd, timeout)
+	var exit badExit
+	if err == nil || errors.As(err, &exit) || ctx.Err() != nil {
+		return err
+	}
+	execRetries.Add(1)
+	select {
+	case <-time.After(execRetryBackoff):
+	case <-ctx.Done():
+		return err
+	}
+	return execOnce(ctx, sb, cmd, timeout)
+}
+
+// execOnce is a single attempt. It never reads stdout, so the SDK's lazy output
+// streams are never opened.
+//
+// Every call is bounded. SandboxExecParams.Timeout defaults to no timeout and
+// only reaches the server-side wait anyway; ExecStart is bounded by the context
+// alone, so a Sandbox that never becomes usable would otherwise block its
+// session goroutine forever and stop the shard from ever finishing.
+func execOnce(ctx context.Context, sb *modal.Sandbox, cmd string, timeout time.Duration) error {
+	left, ok := execBudget(ctx, timeout)
+	if !ok {
+		return fmt.Errorf("timed out after %s", timeout)
+	}
+	proc, err := sb.Exec(ctx, []string{"sh", "-c", cmd}, &modal.SandboxExecParams{Timeout: left})
 	if err != nil {
-		return fmt.Errorf("exec: %w", err)
+		return fmt.Errorf("exec: %w", execErr(err, timeout))
 	}
 	exitCode, err := proc.Wait(ctx, nil)
 	if err != nil {
-		return fmt.Errorf("wait for exec: %w", err)
+		return fmt.Errorf("wait for exec: %w", execErr(err, timeout))
 	}
 	if exitCode != 0 {
-		return fmt.Errorf("command exited with code %d", exitCode)
+		return badExit{code: exitCode}
 	}
 	return nil
+}
+
+// execBudget is the timeout to hand the SDK for one attempt: whatever is left
+// on the context, truncated to whole seconds. The SDK rejects a fractional
+// Timeout outright and reads zero as "no timeout", so anything under a second
+// reports false and the caller gives up instead of starting an unbounded exec.
+func execBudget(ctx context.Context, timeout time.Duration) (time.Duration, bool) {
+	left := timeout
+	if deadline, ok := ctx.Deadline(); ok {
+		left = time.Until(deadline)
+	}
+	left = left.Truncate(time.Second)
+	if left < time.Second {
+		return 0, false
+	}
+	return left, true
+}
+
+// execErr names a timeout plainly so the failure-reason table groups stuck
+// Sandboxes together instead of scattering them across context errors.
+func execErr(err error, timeout time.Duration) error {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return fmt.Errorf("timed out after %s", timeout)
+	}
+	return err
 }
 
 // session runs one Sandbox through its whole life: create, workload, hold,
@@ -482,7 +563,8 @@ func session(ctx context.Context, mc *modal.Client, app *modal.App, image *modal
 	// is sized in, so asking for anything else measures a different thing.
 	sb, err := mc.Sandboxes.ExperimentalCreate(ctx, app, image, &modal.SandboxCreateParams{
 		Command: []string{"sleep", "infinity"},
-		Timeout: *lifetime + timeoutMargin,
+		// Whole seconds: the SDK rejects a fractional Sandbox Timeout too.
+		Timeout: (*lifetime + timeoutMargin).Truncate(time.Second),
 	})
 	if err != nil {
 		return fmt.Errorf("create sandbox: %w", err)
@@ -495,19 +577,16 @@ func session(ctx context.Context, mc *modal.Client, app *modal.App, image *modal
 	recordMax(&lastCreateNs, createdAt.UnixNano())
 	recordPeak(live.Add(1))
 	defer func() {
-		sb.Terminate(context.WithoutCancel(ctx), nil) //nolint:errcheck // best-effort cleanup
+		terminate(ctx, sb)
 		live.Add(-1)
 	}()
-	if createTook > slowThreshold {
-		log.Printf("slow create: sandbox %s took %s", sb.SandboxID, createTook.Round(time.Millisecond))
-	}
 
 	// An empty -cmd skips the exec entirely. The first exec on a Sandbox both
 	// waits for the container to boot and opens a per-Sandbox connection, so
 	// skipping it isolates raw create throughput from those costs.
 	if cmd != "" {
 		execStart := time.Now()
-		if err := runCmd(ctx, sb, cmd); err != nil {
+		if err := runCmd(ctx, sb, cmd, *execTimeout); err != nil {
 			return fmt.Errorf("workload on %s: %w", sb.SandboxID, err)
 		}
 		done := time.Now()
@@ -615,7 +694,7 @@ func runShard(ctx context.Context, mc *modal.Client, app *modal.App, runner *mod
 		return fmt.Errorf("create runner sandbox: %w", err)
 	}
 	createTook := time.Since(createStart)
-	defer sb.Terminate(context.WithoutCancel(ctx), nil) //nolint:errcheck // best-effort cleanup
+	defer terminate(ctx, sb)
 
 	// On interrupt, terminate the runner right away: that stops the remote load
 	// test and ends the output streams below, which would otherwise keep
@@ -625,7 +704,7 @@ func runShard(ctx context.Context, mc *modal.Client, app *modal.App, runner *mod
 	go func() {
 		select {
 		case <-ctx.Done():
-			sb.Terminate(context.WithoutCancel(ctx), nil) //nolint:errcheck // best-effort
+			terminate(ctx, sb)
 		case <-watchDone:
 		}
 	}()
@@ -678,6 +757,10 @@ func runShard(ctx context.Context, mc *modal.Client, app *modal.App, runner *mod
 				}
 				if strings.HasPrefix(line, "#missed ") {
 					agg.missed.Add(1)
+					continue
+				}
+				if n, ok := parseCountLine(line, "#retries "); ok {
+					agg.retries.Add(n)
 					continue
 				}
 				fmt.Printf("[shard %d] %s\n", idx, line)
@@ -962,14 +1045,15 @@ Flags:
 		if missedBarrier.Load() {
 			fmt.Printf("#missed 1\n")
 		}
+		fmt.Printf("#retries %d\n", execRetries.Load())
 		m.report(true)
 		fails.report(true)
 		return
 	}
 	createSpan, sustained := createWindow()
-	fmt.Printf("\ncreated %d Sandboxes in %s of creates (%.0f/s sustained), peak %d live, %d ready, %d failed\n",
+	fmt.Printf("\ncreated %d Sandboxes in %s of creates (%.0f/s sustained), peak %d live, %d ready, %d failed, %d exec retries\n",
 		created.Load(), createSpan.Round(time.Millisecond), sustained,
-		peakLive.Load(), ready.Load(), failures.Load())
+		peakLive.Load(), ready.Load(), failures.Load(), execRetries.Load())
 	fmt.Printf("wall %s, which includes the %s lifetime hold\n\n", elapsed.Round(time.Second), lifetime.String())
 	m.report(false)
 	fails.report(false)
