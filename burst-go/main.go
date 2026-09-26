@@ -47,8 +47,8 @@
 //
 // Every run appends a record to -history. Before a run, if -total is more than
 // 2x the largest clean run of the last 7 days (or above 500 with no run),
-// burst proposes that lower load and asks to confirm it. Use -force to skip the
-// check.
+// burst asks before running: y runs the requested -total, and n or Enter
+// aborts. Use -force to skip the check.
 //
 // When doing large runs, please let someone at Modal know.
 package main
@@ -719,36 +719,36 @@ func stepLimit(proven int) int {
 	return proven * maxStepFactor
 }
 
-// preflightTotal returns the -total to actually run. Above stepLimit it
-// proposes the limit instead; the default answer takes the lower load, so an
-// operator who just presses Enter stays safe.
-func preflightTotal(total, proven int, interactive, force bool, in io.Reader, out io.Writer) int {
+// preflightConfirm reports whether a run of total may go ahead. Above
+// stepLimit it asks; anything but an explicit yes aborts, so an operator who
+// just presses Enter, or a script with no terminal, does not launch the burst.
+func preflightConfirm(total, proven int, interactive, force bool, in io.Reader, out io.Writer) bool {
 	limit := stepLimit(proven)
 	if total <= limit {
-		return total
+		return true
 	}
 	var reason string
 	if proven > 0 {
 		reason = fmt.Sprintf("%.1fx previous test", float64(total)/float64(proven))
-		fmt.Fprintf(out, "Largest clean load test in the last %d days was %s. Proposed test is %s (%s).\n",
-			historyWindowDays, commas(proven), commas(total), reason)
+		fmt.Fprintf(out, "Largest clean load test in the last %d days was %s. Proposed test is %s (%s); up to %s runs without confirmation.\n",
+			historyWindowDays, commas(proven), commas(total), reason, commas(limit))
 	} else {
 		reason = "no clean previous test"
-		fmt.Fprintf(out, "No clean load test in the last %d days. Proposed test is %s; up to %s runs without one.\n",
-			historyWindowDays, commas(total), commas(noHistoryMax))
+		fmt.Fprintf(out, "No clean load test in the last %d days. Proposed test is %s; up to %s runs without confirmation.\n",
+			historyWindowDays, commas(total), commas(limit))
 	}
 	switch {
 	case force:
 		fmt.Fprintf(out, "-force set. Proceeding with %s (WARN: %s)...\n", commas(total), reason)
-		return total
+		return true
 	case !interactive:
-		fmt.Fprintf(out, "stdin is not a terminal, so running at the proposed %s. Pass -force to run %s.\n",
-			commas(limit), commas(total))
-		return limit
+		fmt.Fprintf(out, "Aborted: stdin is not a terminal. Pass -force to run %s, or lower -total to %s.\n",
+			commas(total), commas(limit))
+		return false
 	}
 	scanner := bufio.NewScanner(in)
 	for {
-		fmt.Fprintf(out, "Proposing load be set at %s. Accept? [Y/n] ", commas(limit))
+		fmt.Fprintf(out, "Run with -total %s anyway? [y/N] ", commas(total))
 		answer := ""
 		if scanner.Scan() {
 			answer = strings.ToLower(strings.TrimSpace(scanner.Text()))
@@ -756,12 +756,12 @@ func preflightTotal(total, proven int, interactive, force bool, in io.Reader, ou
 			fmt.Fprintln(out)
 		}
 		switch answer {
-		case "", "y", "yes":
-			fmt.Fprintf(out, "Running test at %s...\n", commas(limit))
-			return limit
-		case "n", "no":
-			fmt.Fprintf(out, "Load reduction rejected. Proceeding with %s (WARN: %s)...\n", commas(total), reason)
-			return total
+		case "y", "yes":
+			fmt.Fprintf(out, "Proceeding with %s (WARN: %s)...\n", commas(total), reason)
+			return true
+		case "", "n", "no":
+			fmt.Fprintf(out, "Aborted. Lower -total to %s to run without confirmation.\n", commas(limit))
+			return false
 		}
 	}
 }
@@ -1053,8 +1053,8 @@ With -shards, the runner image must ship CA certificates or the runners cannot
 reach Modal. alpine:3.21 does; debian:bookworm-slim does not.
 
 Each run is appended to -history. If -total is more than 2x the largest clean
-run of the last 7 days (or above 500 with none), burst proposes the lower load
-and asks to confirm. -force skips the check.
+run of the last 7 days (or above 500 with none), burst asks before running:
+y runs the requested -total, n or Enter aborts. -force skips the check.
 
 Flags:
 
@@ -1087,7 +1087,9 @@ Flags:
 		if err != nil {
 			log.Fatalf("read -history %s: %v", *historyPath, err)
 		}
-		*total = preflightTotal(*total, largestCleanTotal(runs, time.Now()), stdinIsTerminal(), *force, os.Stdin, os.Stderr)
+		if !preflightConfirm(*total, largestCleanTotal(runs, time.Now()), stdinIsTerminal(), *force, os.Stdin, os.Stderr) {
+			os.Exit(1)
+		}
 	}
 
 	if *concurrency == 0 {

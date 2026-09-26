@@ -63,40 +63,41 @@ func TestLargestCleanTotal(t *testing.T) {
 	}
 }
 
-func TestPreflightTotal(t *testing.T) {
+func TestPreflightConfirm(t *testing.T) {
 	for _, tc := range []struct {
 		name               string
 		total, proven      int
 		interactive, force bool
 		input              string
-		want               int
+		want               bool
 	}{
-		{"within step", 2000, 1000, true, false, "", 2000},
-		{"within no-history max", 500, 0, true, false, "", 500},
-		{"enter accepts reduction", 5500, 1000, true, false, "\n", 2000},
-		{"Y accepts reduction", 5500, 1000, true, false, "Y\n", 2000},
-		{"n keeps proposed load", 5500, 1000, true, false, "n\n", 5500},
-		{"reprompts on junk", 5500, 1000, true, false, "maybe\nno\n", 5500},
-		{"EOF accepts reduction", 5500, 1000, true, false, "", 2000},
-		{"no history reduces to base", 5500, 0, true, false, "y\n", noHistoryMax},
-		{"non-interactive reduces", 5500, 1000, false, false, "", 2000},
-		{"force keeps proposed load", 5500, 1000, false, true, "", 5500},
+		{"within step", 2000, 1000, true, false, "", true},
+		{"within no-history max", 500, 0, true, false, "", true},
+		{"y runs", 5500, 1000, true, false, "y\n", true},
+		{"YES runs", 5500, 1000, true, false, "YES\n", true},
+		{"n aborts", 5500, 1000, true, false, "n\n", false},
+		{"enter aborts", 5500, 1000, true, false, "\n", false},
+		{"EOF aborts", 5500, 1000, true, false, "", false},
+		{"reprompts on junk", 5500, 1000, true, false, "maybe\ny\n", true},
+		{"no history asks", 5500, 0, true, false, "n\n", false},
+		{"non-interactive aborts", 5500, 1000, false, false, "y\n", false},
+		{"force runs", 5500, 1000, false, true, "", true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			got := preflightTotal(tc.total, tc.proven, tc.interactive, tc.force, strings.NewReader(tc.input), io.Discard)
+			got := preflightConfirm(tc.total, tc.proven, tc.interactive, tc.force, strings.NewReader(tc.input), io.Discard)
 			if got != tc.want {
-				t.Errorf("got %d, want %d", got, tc.want)
+				t.Errorf("got %v, want %v", got, tc.want)
 			}
 		})
 	}
 }
 
-func TestPreflightTotalMessage(t *testing.T) {
+func TestPreflightConfirmMessage(t *testing.T) {
 	var out strings.Builder
-	preflightTotal(5500, 1000, true, false, strings.NewReader("n\n"), &out)
+	preflightConfirm(5500, 1000, true, false, strings.NewReader("y\n"), &out)
 	for _, want := range []string{
-		"was 1,000. Proposed test is 5,500 (5.5x previous test)",
-		"Proposing load be set at 2,000. Accept? [Y/n]",
+		"was 1,000. Proposed test is 5,500 (5.5x previous test); up to 2,000 runs without confirmation.",
+		"Run with -total 5,500 anyway? [y/N]",
 		"Proceeding with 5,500 (WARN: 5.5x previous test)",
 	} {
 		if !strings.Contains(out.String(), want) {
