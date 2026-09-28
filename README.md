@@ -82,9 +82,31 @@ container limits.
 | `--shard-cpu` / `--shard-memory-mb` | `4.0` / `4096` | shard sandbox resources |
 | `--sandbox-timeout-s` | `3600` | inner-sandbox lifetime |
 | `--shard-timeout-s` | `3600` | shard-sandbox lifetime and exec timeout |
+| `--signal-host` | off | send per-sandbox ON/OFF liveness signals to this canvas server (see below) |
+| `--signal-port` / `--signal-token` / `--signal-base` | `7777` / `$SIGNAL_TOKEN` / `0` | signal transport settings |
 
 Inner sandboxes use Modal's default resources. Numeric arguments reject negative
 values, and sizes and timeouts must be greater than zero.
+
+## Liveness signals (canvas demo)
+
+With `--signal-host`, every inner sandbox lights one tile on a
+[million-sandboxes](https://github.com/modal-projects/million-sandboxes) canvas
+while its build runs:
+
+```bash
+SIGNAL_TOKEN=<token> uv run python -m modal_burst.orchestrator --total 1000 \
+  --signal-host <nlb-dns>            # + --signal-port 7777 if not the default
+```
+
+Sandbox `i` (0-based across the whole run) signals id `--signal-base + i`.
+`workload.sh` sends `[token][id u32 LE][1]` over UDP the moment it starts and
+`[..][0]` from its EXIT trap; the Go shard sends a second OFF after
+`Terminate`, so a sandbox killed mid-build still clears its tile. Signals are
+fire-and-forget (`bash` `/dev/udp`) and never affect benchmark results. The
+server maps ids to tiles (target image first), so the picture forms as
+creates land and decays as builds finish. Use `--signal-base` to stack a
+second run on top of a still-running one instead of reusing its ids.
 
 ## Results
 

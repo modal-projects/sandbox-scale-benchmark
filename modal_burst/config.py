@@ -16,6 +16,11 @@ class Config:
     shard_cpu: float = 4.0
     shard_memory_mb: int = 4096
     shard_timeout_s: int = 3600
+    # Liveness signals to a million-sandboxes canvas server; off when host is empty.
+    signal_host: str = ""
+    signal_port: int = 7777
+    signal_token: str = ""
+    signal_base: int = 0  # id offset: sandbox i signals id signal_base + i
 
     @property
     def num_shards(self) -> int:

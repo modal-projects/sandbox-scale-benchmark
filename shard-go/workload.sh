@@ -1,5 +1,20 @@
 #!/usr/bin/env bash
 set -u
+
+# Liveness signals for the canvas server (million-sandboxes): one UDP datagram
+# [token][SIGNAL_ID u32 little-endian][1] when the workload starts, [..][0]
+# when it exits. Best-effort and off unless SIGNAL_HOST is set.
+signal() {
+  [ -n "${SIGNAL_HOST:-}" ] || return 0
+  local id=${SIGNAL_ID:-0} fmt
+  fmt=$(printf '%%s\\x%02x\\x%02x\\x%02x\\x%02x\\x%02x' \
+    $((id & 255)) $(((id >> 8) & 255)) $(((id >> 16) & 255)) $(((id >> 24) & 255)) "$1")
+  # shellcheck disable=SC2059
+  printf "$fmt" "${SIGNAL_TOKEN:-}" >"/dev/udp/$SIGNAL_HOST/${SIGNAL_PORT:-7777}" 2>/dev/null || true
+}
+trap 'signal 0' EXIT
+signal 1
+
 cd /sqlite 2>/dev/null || { echo '{"status":"build_failed","error":"cd /sqlite"}'; exit 0; }
 
 as_tester() { runuser -u tester -- "$@"; }

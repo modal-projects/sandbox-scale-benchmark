@@ -5,9 +5,11 @@ package main
 import (
 	"context"
 	_ "embed"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"strconv"
 	"strings"
@@ -97,6 +99,68 @@ type pooledClient struct {
 	image *modal.Image
 }
 
+// signaller configures the liveness signals inner sandboxes send to the
+// canvas server (million-sandboxes): workload.sh emits ON when it starts and
+// OFF when it exits, addressed by the sandbox's global id. The shard also
+// sends an OFF after terminating each sandbox, so a sandbox that died without
+// running its EXIT trap doesn't leave its tile lit. Disabled when host == "".
+type signaller struct {
+	host  string
+	port  int
+	token string
+	base  int // added to BASE_IDX+idx; lets successive runs light disjoint ids
+	conn  net.Conn
+}
+
+func newSignaller() *signaller {
+	s := &signaller{
+		host:  os.Getenv("SIGNAL_HOST"),
+		port:  envInt("SIGNAL_PORT", 7777),
+		token: os.Getenv("SIGNAL_TOKEN"),
+		base:  envInt("SIGNAL_BASE", 0),
+	}
+	if s.host == "" {
+		return s
+	}
+	conn, err := net.Dial("udp", net.JoinHostPort(s.host, strconv.Itoa(s.port)))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "signal: dial %s: %v (shard-side OFF disabled)\n", s.host, err)
+		return s
+	}
+	s.conn = conn
+	return s
+}
+
+func (s *signaller) enabled() bool { return s.host != "" }
+
+// env returns the variables workload.sh reads to send its own ON/OFF.
+func (s *signaller) env(id int) map[string]string {
+	if !s.enabled() {
+		return nil
+	}
+	return map[string]string{
+		"SIGNAL_HOST":  s.host,
+		"SIGNAL_PORT":  strconv.Itoa(s.port),
+		"SIGNAL_TOKEN": s.token,
+		"SIGNAL_ID":    strconv.Itoa(id),
+	}
+}
+
+// packet is the datagram format: [token][id u32 LE][kind u8], kind 1=ON 0=OFF.
+func (s *signaller) packet(id int, kind byte) []byte {
+	p := make([]byte, len(s.token)+5)
+	copy(p, s.token)
+	binary.LittleEndian.PutUint32(p[len(s.token):], uint32(id))
+	p[len(s.token)+4] = kind
+	return p
+}
+
+func (s *signaller) off(id int) {
+	if s.conn != nil {
+		s.conn.Write(s.packet(id, 0))
+	}
+}
+
 func main() {
 	programStart := time.Now()
 	ctx := context.Background()
@@ -107,6 +171,8 @@ func main() {
 	sbTimeout := time.Duration(envInt("SANDBOX_TIMEOUT_S", 3600)) * time.Second
 	waitForShardCreates := envInt("WAIT_FOR_SHARD_CREATES", 0) != 0
 	appName := env("SANDBOX_APP_NAME", "modal-burst-sandboxes")
+	sig := newSignaller()
+	idBase := sig.base + envInt("BASE_IDX", 0)
 
 	clients := envInt("CLIENTS", 0)
 	if clients <= 0 {
@@ -179,13 +245,14 @@ func main() {
 		go func() {
 			defer buildWg.Done()
 			buildStarts[idx] = time.Now()
-			r := runWorkload(ctx, sb)
+			r := runWorkload(ctx, sb, sig.env(idBase+idx))
 			buildDones[idx] = time.Now()
 			r.CreateMs = createMs[idx]
 			sid := sb.SandboxID
 			r.SandboxID = &sid
 			results[idx] = r
 			sb.Terminate(ctx, nil)
+			sig.off(idBase + idx)
 		}()
 	}
 
@@ -264,11 +331,11 @@ func main() {
 	fmt.Println(string(out))
 }
 
-func runWorkload(ctx context.Context, sb *modal.Sandbox) result {
+func runWorkload(ctx context.Context, sb *modal.Sandbox, env map[string]string) result {
 	proc, err := sb.Exec(
 		ctx,
 		[]string{"bash", "-c", workloadScript},
-		&modal.SandboxExecParams{Stdout: modal.Pipe, Stderr: modal.Ignore},
+		&modal.SandboxExecParams{Stdout: modal.Pipe, Stderr: modal.Ignore, Env: env},
 	)
 	if err != nil {
 		msg := short(fmt.Errorf("Sandbox.Exec: %w", err))
