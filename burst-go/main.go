@@ -203,6 +203,10 @@ func shardSignalBase(base, total, shards, i int) int {
 // platform reaps a Sandbox whose session died without terminating it.
 const timeoutMargin = 5 * time.Minute
 
+// slowCreate is the create latency above which a Sandbox is logged by ID, so
+// stragglers can be traced on the platform side after the run.
+const slowCreate = 5 * time.Second
+
 // Modal object IDs make otherwise-identical failures unique; strip them so the
 // same kind of failure groups together.
 var idRe = regexp.MustCompile(`\b[a-z]{2}-[A-Za-z0-9]{8,}\b`)
@@ -651,6 +655,10 @@ func session(ctx context.Context, mc *modal.Client, app *modal.App, image *modal
 	createdAt := time.Now()
 	createTook := createdAt.Sub(start)
 	m.record("create", createTook)
+	if createTook > slowCreate {
+		log.Printf("slow create: %s took %s (index %d, started %s)",
+			sb.SandboxID, createTook.Round(time.Millisecond), *signalBase+idx, start.UTC().Format(time.RFC3339Nano))
+	}
 	created.Add(1)
 	recordMin(&firstCreateNs, start.UnixNano())
 	recordMax(&lastCreateNs, createdAt.UnixNano())
