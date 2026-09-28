@@ -4,6 +4,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"strconv"
 	"testing"
 	"time"
 )
@@ -81,30 +82,33 @@ func TestWorkloadSignalDatagram(t *testing.T) {
 	defer pc.Close()
 	_, port, _ := net.SplitHostPort(pc.LocalAddr().String())
 
-	cmd := exec.Command("bash", "-c", workloadScript)
-	cmd.Env = append(os.Environ(),
-		"SIGNAL_HOST=127.0.0.1", "SIGNAL_PORT="+port, "SIGNAL_TOKEN=devtok", "SIGNAL_ID=66051")
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		t.Fatalf("bash: %v\n%s", err, out)
-	}
-	if _, ok := parseWorkload(out); !ok {
-		t.Fatalf("workload output not parseable: %s", out)
-	}
-
 	s := &signaller{token: "devtok"}
-	pc.SetReadDeadline(time.Now().Add(5 * time.Second))
 	buf := make([]byte, 64)
-	n, _, err := pc.ReadFrom(buf)
-	if err != nil {
-		t.Fatalf("waiting for ON datagram: %v", err)
-	}
-	if string(buf[:n]) != string(s.packet(66051, 1)) {
-		t.Fatalf("datagram = %v, want %v", buf[:n], s.packet(66051, 1))
-	}
-	// Only ON comes from the workload; OFF is the shard's job after Terminate.
-	pc.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
-	if n, _, err := pc.ReadFrom(buf); err == nil {
-		t.Fatalf("unexpected extra datagram %v", buf[:n])
+	// 2570 = 0x0a0a: ids whose bytes include a newline must still arrive whole.
+	for _, id := range []int{66051, 2570, 0} {
+		cmd := exec.Command("bash", "-c", workloadScript)
+		cmd.Env = append(os.Environ(),
+			"SIGNAL_HOST=127.0.0.1", "SIGNAL_PORT="+port, "SIGNAL_TOKEN=devtok", "SIGNAL_ID="+strconv.Itoa(id))
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("bash: %v\n%s", err, out)
+		}
+		if _, ok := parseWorkload(out); !ok {
+			t.Fatalf("workload output not parseable: %s", out)
+		}
+
+		pc.SetReadDeadline(time.Now().Add(5 * time.Second))
+		n, _, err := pc.ReadFrom(buf)
+		if err != nil {
+			t.Fatalf("id=%d: waiting for ON datagram: %v", id, err)
+		}
+		if string(buf[:n]) != string(s.packet(id, 1)) {
+			t.Fatalf("id=%d: datagram = %v, want %v", id, buf[:n], s.packet(id, 1))
+		}
+		// Only ON comes from the workload; OFF is the shard's job after Terminate.
+		pc.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+		if n, _, err := pc.ReadFrom(buf); err == nil {
+			t.Fatalf("id=%d: unexpected extra datagram %v", id, buf[:n])
+		}
 	}
 }

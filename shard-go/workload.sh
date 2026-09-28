@@ -10,8 +10,10 @@ signal() {
   local id=${SIGNAL_ID:-0} fmt
   fmt=$(printf '%%s\\x%02x\\x%02x\\x%02x\\x%02x\\x%02x' \
     $((id & 255)) $(((id >> 8) & 255)) $(((id >> 16) & 255)) $(((id >> 24) & 255)) "$1")
+  # coreutils printf, not the builtin: bash flushes at every 0x0a, which would
+  # split ids containing that byte into two datagrams.
   # shellcheck disable=SC2059
-  printf "$fmt" "${SIGNAL_TOKEN:-}" >"/dev/udp/$SIGNAL_HOST/${SIGNAL_PORT:-7777}" 2>/dev/null || true
+  env printf "$fmt" "${SIGNAL_TOKEN:-}" >"/dev/udp/$SIGNAL_HOST/${SIGNAL_PORT:-7777}" 2>/dev/null || true
 }
 signal 1
 
