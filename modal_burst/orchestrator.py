@@ -54,7 +54,19 @@ def _shard_env(idx: int, size: int, base: int, cfg: Config, wenv: dict[str, str]
         "SANDBOX_TIMEOUT_S": str(cfg.sandbox_timeout_s),
         "SANDBOX_LIFETIME_S": str(cfg.sandbox_lifetime_s),
         "SANDBOX_APP_NAME": SANDBOX_APP_NAME,
+        **_signal_env(cfg),
         **wenv,
+    }
+
+
+def _signal_env(cfg: Config) -> dict[str, str]:
+    if not cfg.signal_host:
+        return {}
+    return {
+        "SIGNAL_HOST": cfg.signal_host,
+        "SIGNAL_PORT": str(cfg.signal_port),
+        "SIGNAL_TOKEN": cfg.signal_token,
+        "SIGNAL_BASE": str(cfg.signal_base),
     }
 
 
@@ -248,6 +260,19 @@ def _parse_args() -> Config:
     p.add_argument("--sandbox-timeout-s", type=_positive_int, default=d.sandbox_timeout_s)
     p.add_argument("--sandbox-lifetime-s", type=_positive_int, default=d.sandbox_lifetime_s)
     p.add_argument("--shard-timeout-s", type=_positive_int, default=d.shard_timeout_s)
+    sig = p.add_argument_group(
+        "liveness signals",
+        "Have every inner sandbox send ON/OFF UDP datagrams to a million-sandboxes "
+        "canvas server. Sandbox i signals id --signal-base + i.",
+    )
+    sig.add_argument("--signal-host", default=d.signal_host, help="NLB hostname; unset = no signals")
+    sig.add_argument("--signal-port", type=_positive_int, default=d.signal_port)
+    sig.add_argument(
+        "--signal-token",
+        default=os.environ.get("SIGNAL_TOKEN", d.signal_token),
+        help="shared token (default: $SIGNAL_TOKEN)",
+    )
+    sig.add_argument("--signal-base", type=_nonnegative_int, default=d.signal_base)
     a = p.parse_args()
     return Config(
         total=a.total,
@@ -261,6 +286,10 @@ def _parse_args() -> Config:
         sandbox_timeout_s=a.sandbox_timeout_s,
         sandbox_lifetime_s=a.sandbox_lifetime_s,
         shard_timeout_s=a.shard_timeout_s,
+        signal_host=a.signal_host,
+        signal_port=a.signal_port,
+        signal_token=a.signal_token,
+        signal_base=a.signal_base,
     )
 
 

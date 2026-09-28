@@ -86,6 +86,8 @@ container limits.
 | `--sandbox-lifetime-s` | `300` | how long a shard holds each inner sandbox up before terminating it |
 | `--sandbox-timeout-s` | `3600` | inner-sandbox hard cap enforced by Modal; the backstop if a shard dies |
 | `--shard-timeout-s` | `3600` | shard-sandbox lifetime and exec timeout |
+| `--signal-host` | off | send per-sandbox ON/OFF liveness signals to this canvas server (see below) |
+| `--signal-port` / `--signal-token` / `--signal-base` | `7777` / `$SIGNAL_TOKEN` / `0` | signal transport settings |
 
 Inner sandboxes use Modal's default resources. Numeric arguments reject negative
 values, and sizes and timeouts must be greater than zero.
@@ -94,6 +96,27 @@ values, and sizes and timeouts must be greater than zero.
 crashes mid-run, so keep it close to `--sandbox-lifetime-s`. Leaving it at the
 `3600` default while running a 5-minute lifetime means a dead shard leaks its
 sandboxes for an hour.
+
+## Liveness signals (canvas demo)
+
+With `--signal-host`, every inner sandbox lights one tile on a
+[million-sandboxes](https://github.com/modal-projects/million-sandboxes) canvas
+for as long as it is alive:
+
+```bash
+SIGNAL_TOKEN=<token> uv run python -m modal_burst.orchestrator --total 1000 \
+  --signal-host <nlb-dns>            # + --signal-port 7777 if not the default
+```
+
+Sandbox `i` (0-based across the whole run) signals id `--signal-base + i`.
+`workload.sh` sends `[token][id u32 LE][1]` over UDP the moment it starts; the
+Go shard sends `[..][0]` right after `Terminate` at the end of
+`--sandbox-lifetime-s`. Signals are fire-and-forget (`bash` `/dev/udp`) and
+never affect benchmark results. The server maps ids to tiles (target image
+first), so the picture forms as creates land and decays as sandboxes are
+reaped. Use `--signal-base` to stack a second run on top of a still-running
+one instead of reusing its ids. If a shard dies, its tiles stay lit until the
+server is restarted (Modal still reaps the sandboxes via `--sandbox-timeout-s`).
 
 ## Results
 
