@@ -102,6 +102,7 @@ var (
 	runnerImage   = flag.String("runner-image", "burst-runner", "published Image name holding this binary, for -shards runners")
 	workloadCmd   = flag.String("cmd", defaultCmd, "shell command to run in each Sandbox; empty skips the exec (BURST_CMD overrides)")
 	appName       = flag.String("app", "one-million-sandboxes", "Modal App name to create Sandboxes in")
+	runnerApp     = flag.String("runner-app", "", "Modal App name for -shards runner Sandboxes, so they don't count among the workload (default: <app>-runners)")
 	shards        = flag.Int("shards", 0, "spread the run across this many runner Sandboxes on Modal (0 = run directly from this machine)")
 	progressEvery = flag.Duration("progress", 2*time.Second, "how often to print a progress line; rates are measured over this window")
 	execTimeout   = flag.Duration("exec-timeout", 2*time.Minute, "give up on a Sandbox whose workload has not finished in this long")
@@ -1122,7 +1123,8 @@ Examples:
   burst -total 20000 -rate 2000 -lifetime 5m -shards 8
 
 With -shards, the runner image must ship CA certificates or the runners cannot
-reach Modal. alpine:3.21 does; debian:bookworm-slim does not.
+reach Modal. alpine:3.21 does; debian:bookworm-slim does not. Runners live in
+-runner-app (default <app>-runners) so -app holds exactly the workload Sandboxes.
 
 With -signal-host, every Sandbox lights one tile on a million-sandboxes canvas
 (UDP ON after create, OFF after terminate; id = -signal-base + its index).
@@ -1257,9 +1259,16 @@ Flags:
 				"  publish it for this exact binary with:\n"+
 				"    uv run python build_runner_image.py <path to this binary>", ref, err)
 		}
-		log.Printf("runners will boot Image %s", ref)
+		if *runnerApp == "" {
+			*runnerApp = *appName + "-runners"
+		}
+		runners, err := mc.Apps.FromName(ctx, *runnerApp, &modal.AppFromNameParams{CreateIfMissing: true})
+		if err != nil {
+			log.Fatalf("get or create runner App: %v", err)
+		}
+		log.Printf("runners will boot Image %s in App %s", ref, *runnerApp)
 		runStart := time.Now()
-		agg, failedShards := runShards(ctx, mc, app, runner)
+		agg, failedShards := runShards(ctx, mc, runners, runner)
 		recordRun(runRecord{
 			Time:         runStart,
 			Total:        *total,
