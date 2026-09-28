@@ -118,7 +118,7 @@ var (
 	// lights tile -signal-base+i for as long as it is alive.
 	signalHost  = flag.String("signal-host", "", "million-sandboxes canvas host to send per-Sandbox ON/OFF UDP signals to (empty = no signals)")
 	signalPort  = flag.Int("signal-port", 7777, "UDP port on -signal-host")
-	signalToken = flag.String("signal-token", os.Getenv("SIGNAL_TOKEN"), "shared token the canvas expects in front of every signal (default: $SIGNAL_TOKEN)")
+	signalToken = flag.String("signal-token", "", "shared token the canvas expects in front of every signal (default: $SIGNAL_TOKEN)")
 	signalBase  = flag.Int("signal-base", 0, "id of this run's first Sandbox on the canvas")
 )
 
@@ -1197,6 +1197,11 @@ Flags:
 		log.Printf("warning: concurrency %d means that many live Sandboxes and open connections on one host; consider more -shards", *concurrency)
 	}
 
+	// Resolved after parsing so the token is never a flag default, which -h
+	// would print.
+	if *signalToken == "" {
+		*signalToken = os.Getenv("SIGNAL_TOKEN")
+	}
 	sig, err := newSignaller(*signalHost, *signalPort, *signalToken)
 	if err != nil {
 		log.Fatalf("signals: %v", err)
