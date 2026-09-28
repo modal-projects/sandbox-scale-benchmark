@@ -30,7 +30,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("binary", type=pathlib.Path, help="statically linked burst binary")
     parser.add_argument("--name", default="burst-runner", help="published Image name")
-    parser.add_argument("--app", default="sandbox-burst-load-test", help="App to build in")
+    parser.add_argument("--app", default="one-million-sandboxes", help="App to build in")
     args = parser.parse_args()
 
     if not args.binary.is_file():

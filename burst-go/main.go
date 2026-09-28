@@ -101,7 +101,7 @@ var (
 	imageTag      = flag.String("image", "alpine:3.21", "registry tag for the workload Sandboxes")
 	runnerImage   = flag.String("runner-image", "burst-runner", "published Image name holding this binary, for -shards runners")
 	workloadCmd   = flag.String("cmd", defaultCmd, "shell command to run in each Sandbox; empty skips the exec (BURST_CMD overrides)")
-	appName       = flag.String("app", "sandbox-burst-load-test", "Modal App name to create Sandboxes in")
+	appName       = flag.String("app", "one-million-sandboxes", "Modal App name to create Sandboxes in")
 	shards        = flag.Int("shards", 0, "spread the run across this many runner Sandboxes on Modal (0 = run directly from this machine)")
 	progressEvery = flag.Duration("progress", 2*time.Second, "how often to print a progress line; rates are measured over this window")
 	execTimeout   = flag.Duration("exec-timeout", 2*time.Minute, "give up on a Sandbox whose workload has not finished in this long")
