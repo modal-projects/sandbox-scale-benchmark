@@ -7,7 +7,7 @@ import modal
 
 APP_NAME = "modal-burst"
 # Inner sandboxes (the ones under test) live in their own App.
-SANDBOX_APP_NAME = "modal-burst-sandboxes"
+SANDBOX_APP_NAME = "one-million-sandboxes"
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SHARD_SRC = REPO_ROOT / "shard-go"

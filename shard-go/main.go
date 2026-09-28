@@ -160,7 +160,7 @@ func main() {
 	sbTimeout := time.Duration(envInt("SANDBOX_TIMEOUT_S", 3600)) * time.Second
 	lifetime := time.Duration(envInt("SANDBOX_LIFETIME_S", 300)) * time.Second
 	waitForShardCreates := envInt("WAIT_FOR_SHARD_CREATES", 0) != 0
-	appName := env("SANDBOX_APP_NAME", "modal-burst-sandboxes")
+	appName := env("SANDBOX_APP_NAME", "one-million-sandboxes")
 	sig := newSignaller()
 	idBase := sig.base + envInt("BASE_IDX", 0)
 

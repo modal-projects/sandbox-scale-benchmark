@@ -135,7 +135,7 @@ Workload and exec-start failures are recorded as their own benchmark outcomes.
 - Sandbox creation uses experimental Modal APIs and may need changes when the
   SDK changes.
 - The orchestrator creates persistent `modal-burst` and
-  `modal-burst-sandboxes` Apps. Stop or delete them from the Modal dashboard
+  `one-million-sandboxes` Apps. Stop or delete them from the Modal dashboard
   when they are no longer needed.
 - Modal credentials are forwarded to shard sandboxes through environment
   variables so each Go client can create inner sandboxes. Only run this in an
