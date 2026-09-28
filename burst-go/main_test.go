@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -283,4 +284,68 @@ func TestExecBudget(t *testing.T) {
 			t.Error("expired context still yielded a budget")
 		}
 	})
+}
+
+func TestSignalPacket(t *testing.T) {
+	got := signalPacket("tok", 0x01020304, 1)
+	want := []byte{'t', 'o', 'k', 4, 3, 2, 1, 1}
+	if string(got) != string(want) {
+		t.Fatalf("packet = %v, want %v", got, want)
+	}
+	if p := signalPacket("", 10, 0); string(p) != string([]byte{10, 0, 0, 0, 0}) {
+		t.Fatalf("empty-token packet = %v", p)
+	}
+}
+
+func TestShardSignalBase(t *testing.T) {
+	// 10 Sandboxes over 3 shards: shard 0 takes the remainder (4), then 3, 3.
+	// Shards must tile the id range exactly, with no overlap and no gap.
+	const base, total, shards = 100, 10, 3
+	want := []int{100, 104, 107}
+	for i, w := range want {
+		if got := shardSignalBase(base, total, shards, i); got != w {
+			t.Fatalf("shard %d base = %d, want %d", i, got, w)
+		}
+	}
+	if end := shardSignalBase(base, total, shards, shards-1) + total/shards; end != base+total {
+		t.Fatalf("last shard ends at %d, want %d", end, base+total)
+	}
+}
+
+func TestSignallerNilIsNoop(t *testing.T) {
+	var s *signaller
+	s.on(1) // must not panic when signals are disabled
+	s.off(1)
+	if s, err := newSignaller("", 7777, ""); s != nil || err != nil {
+		t.Fatalf("no host = (%v, %v), want disabled", s, err)
+	}
+	if _, err := newSignaller("127.0.0.1", 7777, ""); err == nil {
+		t.Fatal("host without token should be rejected")
+	}
+}
+
+func TestSignallerSendsDatagrams(t *testing.T) {
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pc.Close() //nolint:errcheck
+	port := pc.LocalAddr().(*net.UDPAddr).Port
+	s, err := newSignaller("127.0.0.1", port, "devtok")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.on(2570) // 0x0a0a: bytes that would split a line-based sender
+	s.off(2570)
+	buf := make([]byte, 64)
+	for _, want := range [][]byte{signalPacket("devtok", 2570, 1), signalPacket("devtok", 2570, 0)} {
+		pc.SetReadDeadline(time.Now().Add(5 * time.Second)) //nolint:errcheck
+		n, _, err := pc.ReadFrom(buf)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(buf[:n]) != string(want) {
+			t.Fatalf("datagram = %v, want %v", buf[:n], want)
+		}
+	}
 }

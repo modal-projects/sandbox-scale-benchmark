@@ -57,6 +57,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -65,6 +66,7 @@ import (
 	"io"
 	"log"
 	"math"
+	"net"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -110,6 +112,13 @@ var (
 	runnerMemory  = flag.Int("runner-memory", 4096, "MiB of memory per -shards runner Sandbox")
 	historyPath   = flag.String("history", defaultHistoryPath(), "JSONL file of past runs, used to check -total against the largest recent clean run")
 	force         = flag.Bool("force", false, "skip the confirm step when -total is a large jump over the largest recent clean run")
+
+	// Liveness signals for the million-sandboxes canvas: Sandbox i of the run
+	// lights tile -signal-base+i for as long as it is alive.
+	signalHost  = flag.String("signal-host", "", "million-sandboxes canvas host to send per-Sandbox ON/OFF UDP signals to (empty = no signals)")
+	signalPort  = flag.Int("signal-port", 7777, "UDP port on -signal-host")
+	signalToken = flag.String("signal-token", os.Getenv("SIGNAL_TOKEN"), "shared token the canvas expects in front of every signal (default: $SIGNAL_TOKEN)")
+	signalBase  = flag.Int("signal-base", 0, "id of this run's first Sandbox on the canvas")
 )
 
 var (
@@ -138,6 +147,56 @@ var (
 	// We hard limit the create rate to get an accurate benchmark.
 	bootLimiter <-chan struct{}
 )
+
+// signaller sends the canvas one datagram per Sandbox state change:
+// [token][id uint32 LE][kind], kind 1 = ON, 0 = OFF. Datagrams are
+// fire-and-forget; a lost one leaves a tile stale but never fails a session.
+type signaller struct {
+	token string
+	conn  net.Conn
+}
+
+func newSignaller(host string, port int, token string) (*signaller, error) {
+	if host == "" {
+		return nil, nil
+	}
+	if token == "" {
+		return nil, errors.New("-signal-host needs a token: pass -signal-token or set $SIGNAL_TOKEN")
+	}
+	conn, err := net.Dial("udp", net.JoinHostPort(host, strconv.Itoa(port)))
+	if err != nil {
+		return nil, fmt.Errorf("dial %s: %w", host, err)
+	}
+	return &signaller{token: token, conn: conn}, nil
+}
+
+func signalPacket(token string, id int, kind byte) []byte {
+	p := make([]byte, len(token)+5)
+	copy(p, token)
+	binary.LittleEndian.PutUint32(p[len(token):], uint32(id))
+	p[len(token)+4] = kind
+	return p
+}
+
+func (s *signaller) send(id int, kind byte) {
+	if s == nil {
+		return
+	}
+	s.conn.Write(signalPacket(s.token, id, kind)) //nolint:errcheck // best-effort
+}
+
+func (s *signaller) on(id int)  { s.send(id, 1) }
+func (s *signaller) off(id int) { s.send(id, 0) }
+
+// shardSignalBase is the canvas id of shard i's first Sandbox, matching how
+// runShards deals out -total (the remainder goes to shard 0).
+func shardSignalBase(base, total, shards, i int) int {
+	per := total / shards
+	if i == 0 {
+		return base
+	}
+	return base + per + total%shards + (i-1)*per
+}
 
 // timeoutMargin is added to -lifetime for the Sandbox's own Timeout, so the
 // platform reaps a Sandbox whose session died without terminating it.
@@ -567,8 +626,8 @@ func execErr(err error, timeout time.Duration) error {
 }
 
 // session runs one Sandbox through its whole life: create, workload, hold,
-// terminate.
-func session(ctx context.Context, mc *modal.Client, app *modal.App, image *modal.Image, cmd string, m *metrics) error {
+// terminate. idx is the Sandbox's 0-based position in this process's run.
+func session(ctx context.Context, mc *modal.Client, app *modal.App, image *modal.Image, cmd string, m *metrics, sig *signaller, idx int) error {
 	if bootLimiter != nil {
 		select {
 		case <-bootLimiter:
@@ -595,9 +654,11 @@ func session(ctx context.Context, mc *modal.Client, app *modal.App, image *modal
 	recordMin(&firstCreateNs, start.UnixNano())
 	recordMax(&lastCreateNs, createdAt.UnixNano())
 	recordPeak(live.Add(1))
+	sig.on(*signalBase + idx)
 	defer func() {
 		terminate(ctx, sb)
 		live.Add(-1)
+		sig.off(*signalBase + idx)
 	}()
 
 	// An empty -cmd skips the exec entirely. The first exec on a Sandbox both
@@ -907,6 +968,13 @@ func runShard(ctx context.Context, mc *modal.Client, app *modal.App, runner *mod
 		"-image", *imageTag,
 		"-app", *appName,
 	}
+	if *signalHost != "" {
+		cmd = append(cmd,
+			"-signal-host", *signalHost,
+			"-signal-port", strconv.Itoa(*signalPort),
+			"-signal-base", strconv.Itoa(shardSignalBase(*signalBase, *total, *shards, idx)),
+		)
+	}
 	run, err := sb.Exec(ctx, cmd, &modal.SandboxExecParams{Env: env})
 	if err != nil {
 		return fmt.Errorf("start load test: %w", err)
@@ -987,6 +1055,10 @@ func runShards(ctx context.Context, mc *modal.Client, app *modal.App, runner *mo
 	// Sent as-is, including empty, so -cmd "" reaches the runners too.
 	env["BURST_CMD"] = *workloadCmd
 	env["BURST_CMD_SET"] = "1"
+	// The token travels in the env, not argv, so it never shows in a ps listing.
+	if *signalHost != "" {
+		env["SIGNAL_TOKEN"] = *signalToken
+	}
 	agg := &aggregateDurations{}
 
 	perTotal := *total / *shards
@@ -1051,6 +1123,9 @@ Examples:
 
 With -shards, the runner image must ship CA certificates or the runners cannot
 reach Modal. alpine:3.21 does; debian:bookworm-slim does not.
+
+With -signal-host, every Sandbox lights one tile on a million-sandboxes canvas
+(UDP ON after create, OFF after terminate; id = -signal-base + its index).
 
 Each run is appended to -history. If -total is more than 2x the largest clean
 run of the last 7 days (or above 500 with none), burst asks before running:
@@ -1118,6 +1193,15 @@ Flags:
 	}
 	if *concurrency > 100_000 {
 		log.Printf("warning: concurrency %d means that many live Sandboxes and open connections on one host; consider more -shards", *concurrency)
+	}
+
+	sig, err := newSignaller(*signalHost, *signalPort, *signalToken)
+	if err != nil {
+		log.Fatalf("signals: %v", err)
+	}
+	if sig != nil {
+		log.Printf("signals -> udp://%s:%d ids %d..%d (token: %d chars)",
+			*signalHost, *signalPort, *signalBase, *signalBase+*total-1, len(*signalToken))
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
@@ -1247,7 +1331,7 @@ Flags:
 				if n > int64(*total) {
 					return
 				}
-				if err := session(ctx, client, app, base, cmd, m); err != nil && ctx.Err() == nil {
+				if err := session(ctx, client, app, base, cmd, m, sig, int(n-1)); err != nil && ctx.Err() == nil {
 					failures.Add(1)
 					fails.add(err)
 					log.Printf("session %d: %v", n, err)

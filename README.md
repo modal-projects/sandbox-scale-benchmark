@@ -118,6 +118,18 @@ reaped. Use `--signal-base` to stack a second run on top of a still-running
 one instead of reusing its ids. If a shard dies, its tiles stay lit until the
 server is restarted (Modal still reaps the sandboxes via `--sandbox-timeout-s`).
 
+`burst-go` takes the same flags (`-signal-host`, `-signal-port`,
+`-signal-token`/`$SIGNAL_TOKEN`, `-signal-base`). There the burst process
+itself signals: ON as soon as a Sandbox's create returns, OFF right after its
+Terminate. With `-shards`, each runner gets its own contiguous id range and
+sends its own signals (the token is passed in the runner's env, the rest on
+its command line), so a 1M run needs no extra plumbing:
+
+```bash
+SIGNAL_TOKEN=<token> ./burst -total 1000000 -rate 20000 -lifetime 10m -shards 200 \
+  -signal-host <nlb-dns>
+```
+
 ## Results
 
 Each run writes `results/<run_id>/meta.json` and `raw.jsonl`. The aggregate
