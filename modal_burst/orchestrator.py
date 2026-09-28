@@ -138,6 +138,11 @@ async def run(cfg: Config) -> None:
         f"run_id={run_id} total={cfg.total} shard_size={cfg.shard_size} "
         f"num_shards={num_shards} ramp_s={cfg.ramp_s}"
     )
+    if cfg.signal_host:
+        print(
+            f"signals -> udp://{cfg.signal_host}:{cfg.signal_port} "
+            f"ids {cfg.signal_base}..{cfg.signal_base + cfg.total - 1} (token: {len(cfg.signal_token)} chars)"
+        )
 
     t0 = time.perf_counter()
     sbs: list[modal.Sandbox] = []
@@ -272,6 +277,8 @@ def _parse_args() -> Config:
     )
     sig.add_argument("--signal-base", type=_nonnegative_int, default=d.signal_base)
     a = p.parse_args()
+    if a.signal_host and not a.signal_token:
+        p.error("--signal-host needs a token: pass --signal-token or set $SIGNAL_TOKEN")
     return Config(
         total=a.total,
         shard_size=a.shard_size,
