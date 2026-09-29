@@ -1070,6 +1070,9 @@ func runShards(ctx context.Context, mc *modal.Client, app *modal.App, runner *mo
 	}
 	agg := &aggregateDurations{}
 
+	// Shard 0 takes every remainder. Its concurrency must grow with its total,
+	// or the leftover Sandboxes wait a whole -lifetime for a slot and the run
+	// peaks at total - remainder.
 	perTotal := *total / *shards
 	perConcurrency := max(*concurrency / *shards, 1)
 	perRate := 0
@@ -1097,11 +1100,15 @@ func runShards(ctx context.Context, mc *modal.Client, app *modal.App, runner *mo
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			shardTotal := perTotal
+			shardTotal, shardConcurrency, shardRate := perTotal, perConcurrency, perRate
 			if i == 0 {
 				shardTotal += *total % *shards
+				shardConcurrency += *concurrency % *shards
+				if *rate > 0 {
+					shardRate += *rate % *shards
+				}
 			}
-			if err := runShard(ctx, mc, app, runner, i, env, shardTotal, perConcurrency, perRate, startAtNs, agg); err != nil {
+			if err := runShard(ctx, mc, app, runner, i, env, shardTotal, shardConcurrency, shardRate, startAtNs, agg); err != nil {
 				failedShards.Add(1)
 				log.Printf("[shard %d] %v", i, err)
 			}
