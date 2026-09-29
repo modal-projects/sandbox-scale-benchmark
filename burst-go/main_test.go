@@ -316,11 +316,15 @@ func TestSignallerNilIsNoop(t *testing.T) {
 	var s *signaller
 	s.on(1) // must not panic when signals are disabled
 	s.off(1)
-	if s, err := newSignaller("", 7777, ""); s != nil || err != nil {
+	s.flush()
+	if s, err := newSignaller("", 7777, "", 1, 0); s != nil || err != nil {
 		t.Fatalf("no host = (%v, %v), want disabled", s, err)
 	}
-	if _, err := newSignaller("127.0.0.1", 7777, ""); err == nil {
+	if _, err := newSignaller("127.0.0.1", 7777, "", 1, 0); err == nil {
 		t.Fatal("host without token should be rejected")
+	}
+	if _, err := newSignaller("127.0.0.1", 7777, "tok", 0, 0); err == nil {
+		t.Fatal("repeat 0 should be rejected")
 	}
 }
 
@@ -331,7 +335,7 @@ func TestSignallerSendsDatagrams(t *testing.T) {
 	}
 	defer pc.Close() //nolint:errcheck
 	port := pc.LocalAddr().(*net.UDPAddr).Port
-	s, err := newSignaller("127.0.0.1", port, "devtok")
+	s, err := newSignaller("127.0.0.1", port, "devtok", 1, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -347,5 +351,36 @@ func TestSignallerSendsDatagrams(t *testing.T) {
 		if string(buf[:n]) != string(want) {
 			t.Fatalf("datagram = %v, want %v", buf[:n], want)
 		}
+	}
+}
+
+func TestSignallerRepeats(t *testing.T) {
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pc.Close() //nolint:errcheck
+	port := pc.LocalAddr().(*net.UDPAddr).Port
+	s, err := newSignaller("127.0.0.1", port, "devtok", 3, 20*time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.off(7)
+	s.flush() // every repeat must be on the wire once flush returns
+	want := signalPacket("devtok", 7, 0)
+	buf := make([]byte, 64)
+	for i := 0; i < 3; i++ {
+		pc.SetReadDeadline(time.Now().Add(time.Second)) //nolint:errcheck
+		n, _, err := pc.ReadFrom(buf)
+		if err != nil {
+			t.Fatalf("repeat %d: %v", i, err)
+		}
+		if string(buf[:n]) != string(want) {
+			t.Fatalf("repeat %d = %v, want %v", i, buf[:n], want)
+		}
+	}
+	pc.SetReadDeadline(time.Now().Add(100 * time.Millisecond)) //nolint:errcheck
+	if n, _, err := pc.ReadFrom(buf); err == nil {
+		t.Fatalf("unexpected 4th datagram %v", buf[:n])
 	}
 }

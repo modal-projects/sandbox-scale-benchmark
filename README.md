@@ -123,10 +123,15 @@ server is restarted (Modal still reaps the sandboxes via `--sandbox-timeout-s`).
 itself signals: ON as soon as a Sandbox's create returns, OFF right after its
 Terminate. With `-shards`, each runner gets its own contiguous id range and
 sends its own signals (the token is passed in the runner's env, the rest on
-its command line), so a 1M run needs no extra plumbing:
+its command line), so a 1M run needs no extra plumbing. Because the canvas
+has no TTL, a single lost datagram would leave a tile wrong for good, so each
+signal is sent `-signal-repeat` times (default 2, `-signal-spacing` 100ms
+apart); the canvas is idempotent, so duplicates are free. Set `-signal-repeat 1`
+to turn that off. For a demo run, `-cmd ""` skips the per-Sandbox exec, whose
+failures would otherwise switch tiles off early:
 
 ```bash
-SIGNAL_TOKEN=<token> ./burst -total 1000000 -rate 20000 -lifetime 10m -shards 200 \
+SIGNAL_TOKEN=<token> ./burst -total 1000000 -rate 20000 -lifetime 10m -shards 200 -cmd "" \
   -signal-host <nlb-dns>
 ```
 

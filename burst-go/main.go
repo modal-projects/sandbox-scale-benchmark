@@ -116,10 +116,12 @@ var (
 
 	// Liveness signals for the million-sandboxes canvas: Sandbox i of the run
 	// lights tile -signal-base+i for as long as it is alive.
-	signalHost  = flag.String("signal-host", "", "million-sandboxes canvas host to send per-Sandbox ON/OFF UDP signals to (empty = no signals)")
-	signalPort  = flag.Int("signal-port", 7777, "UDP port on -signal-host")
-	signalToken = flag.String("signal-token", "", "shared token the canvas expects in front of every signal (default: $SIGNAL_TOKEN)")
-	signalBase  = flag.Int("signal-base", 0, "id of this run's first Sandbox on the canvas")
+	signalHost    = flag.String("signal-host", "", "million-sandboxes canvas host to send per-Sandbox ON/OFF UDP signals to (empty = no signals)")
+	signalPort    = flag.Int("signal-port", 7777, "UDP port on -signal-host")
+	signalToken   = flag.String("signal-token", "", "shared token the canvas expects in front of every signal (default: $SIGNAL_TOKEN)")
+	signalBase    = flag.Int("signal-base", 0, "id of this run's first Sandbox on the canvas")
+	signalRepeat  = flag.Int("signal-repeat", 2, "send each ON/OFF datagram this many times, spaced -signal-spacing apart, so a single lost packet doesn't leave a tile stale (1 = no repeats)")
+	signalSpacing = flag.Duration("signal-spacing", 100*time.Millisecond, "gap between repeats of the same signal")
 )
 
 var (
@@ -149,26 +151,36 @@ var (
 	bootLimiter <-chan struct{}
 )
 
-// signaller sends the canvas one datagram per Sandbox state change:
+// signaller sends the canvas a datagram per Sandbox state change:
 // [token][id uint32 LE][kind], kind 1 = ON, 0 = OFF. Datagrams are
-// fire-and-forget; a lost one leaves a tile stale but never fails a session.
+// fire-and-forget and never fail a session; each is sent repeat times,
+// spacing apart, because the canvas has no TTL and a single lost OFF would
+// leave a tile lit forever (or a lost ON dark). The canvas is idempotent, so
+// duplicates cost it nothing.
 type signaller struct {
-	token string
-	conn  net.Conn
+	token   string
+	conn    net.Conn
+	repeat  int
+	spacing time.Duration
+	// Repeats still waiting for their timer; flush waits for them.
+	pending sync.WaitGroup
 }
 
-func newSignaller(host string, port int, token string) (*signaller, error) {
+func newSignaller(host string, port int, token string, repeat int, spacing time.Duration) (*signaller, error) {
 	if host == "" {
 		return nil, nil
 	}
 	if token == "" {
 		return nil, errors.New("-signal-host needs a token: pass -signal-token or set $SIGNAL_TOKEN")
 	}
+	if repeat < 1 {
+		return nil, fmt.Errorf("-signal-repeat must be >= 1, got %d", repeat)
+	}
 	conn, err := net.Dial("udp", net.JoinHostPort(host, strconv.Itoa(port)))
 	if err != nil {
 		return nil, fmt.Errorf("dial %s: %w", host, err)
 	}
-	return &signaller{token: token, conn: conn}, nil
+	return &signaller{token: token, conn: conn, repeat: repeat, spacing: spacing}, nil
 }
 
 func signalPacket(token string, id int, kind byte) []byte {
@@ -183,11 +195,28 @@ func (s *signaller) send(id int, kind byte) {
 	if s == nil {
 		return
 	}
-	s.conn.Write(signalPacket(s.token, id, kind)) //nolint:errcheck // best-effort
+	p := signalPacket(s.token, id, kind)
+	s.conn.Write(p) //nolint:errcheck // best-effort
+	for i := 1; i < s.repeat; i++ {
+		s.pending.Add(1)
+		time.AfterFunc(time.Duration(i)*s.spacing, func() {
+			defer s.pending.Done()
+			s.conn.Write(p) //nolint:errcheck // best-effort
+		})
+	}
 }
 
 func (s *signaller) on(id int)  { s.send(id, 1) }
 func (s *signaller) off(id int) { s.send(id, 0) }
+
+// flush blocks until every scheduled repeat has been written. Call it before
+// the process exits, or the last Sandboxes' OFF repeats are lost with it.
+func (s *signaller) flush() {
+	if s == nil {
+		return
+	}
+	s.pending.Wait()
+}
 
 // shardSignalBase is the canvas id of shard i's first Sandbox, matching how
 // runShards deals out -total (the remainder goes to shard 0).
@@ -982,6 +1011,8 @@ func runShard(ctx context.Context, mc *modal.Client, app *modal.App, runner *mod
 			"-signal-host", *signalHost,
 			"-signal-port", strconv.Itoa(*signalPort),
 			"-signal-base", strconv.Itoa(shardSignalBase(*signalBase, *total, *shards, idx)),
+			"-signal-repeat", strconv.Itoa(*signalRepeat),
+			"-signal-spacing", signalSpacing.String(),
 		)
 	}
 	run, err := sb.Exec(ctx, cmd, &modal.SandboxExecParams{Env: env})
@@ -1217,13 +1248,13 @@ Flags:
 	if *signalToken == "" {
 		*signalToken = os.Getenv("SIGNAL_TOKEN")
 	}
-	sig, err := newSignaller(*signalHost, *signalPort, *signalToken)
+	sig, err := newSignaller(*signalHost, *signalPort, *signalToken, *signalRepeat, *signalSpacing)
 	if err != nil {
 		log.Fatalf("signals: %v", err)
 	}
 	if sig != nil {
-		log.Printf("signals -> udp://%s:%d ids %d..%d (token: %d chars)",
-			*signalHost, *signalPort, *signalBase, *signalBase+*total-1, len(*signalToken))
+		log.Printf("signals -> udp://%s:%d ids %d..%d, each sent %dx (token: %d chars)",
+			*signalHost, *signalPort, *signalBase, *signalBase+*total-1, *signalRepeat, len(*signalToken))
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
@@ -1369,6 +1400,7 @@ Flags:
 		}()
 	}
 	wg.Wait()
+	sig.flush()
 
 	elapsed := time.Since(start)
 	if isShard {
