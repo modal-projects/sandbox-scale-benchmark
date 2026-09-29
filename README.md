@@ -124,11 +124,18 @@ itself signals: ON as soon as a Sandbox's create returns, OFF right after its
 Terminate. With `-shards`, each runner gets its own contiguous id range and
 sends its own signals (the token is passed in the runner's env, the rest on
 its command line), so a 1M run needs no extra plumbing. Because the canvas
-has no TTL, a single lost datagram would leave a tile wrong for good, so each
-signal is sent `-signal-repeat` times (default 2, `-signal-spacing` 100ms
-apart); the canvas is idempotent, so duplicates are free. Set `-signal-repeat 1`
-to turn that off. For a demo run, `-cmd ""` skips the per-Sandbox exec, whose
-failures would otherwise switch tiles off early:
+has no TTL, a lost datagram would leave a tile wrong for good, so every state
+change goes out twice over: the UDP datagram is sent `-signal-repeat` times
+(default 3, `-signal-spacing` 500ms apart, riding out sub-second loss blips),
+and by default it is also POSTed to the canvas over HTTP
+(`-signal-confirm`, port `-signal-http-port` 8080) from a small pool of
+keep-alive connections per runner, retried with backoff, so TCP recovers what
+UDP dropped. The canvas is idempotent, so duplicates are free; UDP keeps the
+picture live while HTTP makes it end up right. The run summary prints a
+WARNING with a count of signals the canvas never confirmed (each is a tile that
+may be wrong). `-signal-repeat 1 -signal-confirm=false` is the bare
+fire-and-forget behavior. For a demo run, `-cmd ""` skips the per-Sandbox exec,
+whose failures would otherwise switch tiles off early:
 
 ```bash
 SIGNAL_TOKEN=<token> ./burst -total 1000000 -rate 20000 -lifetime 10m -shards 200 -cmd "" \

@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -317,25 +319,34 @@ func TestSignallerNilIsNoop(t *testing.T) {
 	s.on(1) // must not panic when signals are disabled
 	s.off(1)
 	s.flush()
-	if s, err := newSignaller("", 7777, "", 1, 0); s != nil || err != nil {
+	if s.unconfirmed() != 0 {
+		t.Fatal("disabled signaller reports unconfirmed signals")
+	}
+	if s, err := newSignaller(signalOpts{port: 7777, repeat: 1}); s != nil || err != nil {
 		t.Fatalf("no host = (%v, %v), want disabled", s, err)
 	}
-	if _, err := newSignaller("127.0.0.1", 7777, "", 1, 0); err == nil {
+	if _, err := newSignaller(signalOpts{host: "127.0.0.1", port: 7777, repeat: 1}); err == nil {
 		t.Fatal("host without token should be rejected")
 	}
-	if _, err := newSignaller("127.0.0.1", 7777, "tok", 0, 0); err == nil {
+	if _, err := newSignaller(signalOpts{host: "127.0.0.1", port: 7777, token: "tok", repeat: 0}); err == nil {
 		t.Fatal("repeat 0 should be rejected")
 	}
 }
 
-func TestSignallerSendsDatagrams(t *testing.T) {
+// udpSink is a local UDP listener standing in for the canvas.
+func udpSink(t *testing.T) (net.PacketConn, int) {
+	t.Helper()
 	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer pc.Close() //nolint:errcheck
-	port := pc.LocalAddr().(*net.UDPAddr).Port
-	s, err := newSignaller("127.0.0.1", port, "devtok", 1, 0)
+	t.Cleanup(func() { pc.Close() }) //nolint:errcheck
+	return pc, pc.LocalAddr().(*net.UDPAddr).Port
+}
+
+func TestSignallerSendsDatagrams(t *testing.T) {
+	pc, port := udpSink(t)
+	s, err := newSignaller(signalOpts{host: "127.0.0.1", port: port, token: "devtok", repeat: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -355,13 +366,8 @@ func TestSignallerSendsDatagrams(t *testing.T) {
 }
 
 func TestSignallerRepeats(t *testing.T) {
-	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer pc.Close() //nolint:errcheck
-	port := pc.LocalAddr().(*net.UDPAddr).Port
-	s, err := newSignaller("127.0.0.1", port, "devtok", 3, 20*time.Millisecond)
+	pc, port := udpSink(t)
+	s, err := newSignaller(signalOpts{host: "127.0.0.1", port: port, token: "devtok", repeat: 3, spacing: 20 * time.Millisecond})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -382,5 +388,123 @@ func TestSignallerRepeats(t *testing.T) {
 	pc.SetReadDeadline(time.Now().Add(100 * time.Millisecond)) //nolint:errcheck
 	if n, _, err := pc.ReadFrom(buf); err == nil {
 		t.Fatalf("unexpected 4th datagram %v", buf[:n])
+	}
+}
+
+// canvasStub records the HTTP signal POSTs the canvas would receive. failFirst
+// answers the first request for each path with a 503, so retries are exercised.
+type canvasStub struct {
+	mu        sync.Mutex
+	got       []string // method+path, in arrival order
+	auth      map[string]bool
+	seen      map[string]int
+	failFirst bool
+}
+
+func (c *canvasStub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.seen == nil {
+		c.seen = map[string]int{}
+		c.auth = map[string]bool{}
+	}
+	c.seen[r.URL.Path]++
+	if c.failFirst && c.seen[r.URL.Path] == 1 {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		return
+	}
+	c.got = append(c.got, r.Method+" "+r.URL.Path)
+	c.auth[r.URL.Path] = r.Header.Get("Authorization") == "Bearer devtok"
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func newTestSignaller(t *testing.T, stub http.Handler) *signaller {
+	t.Helper()
+	_, port := udpSink(t)
+	srv := httptest.NewServer(stub)
+	t.Cleanup(srv.Close)
+	httpPort := srv.Listener.Addr().(*net.TCPAddr).Port
+	s, err := newSignaller(signalOpts{host: "127.0.0.1", port: port, httpPort: httpPort, token: "devtok", repeat: 1, confirm: true, expected: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.confirm.backoff = time.Millisecond
+	return s
+}
+
+func TestSignallerConfirmsOverHTTP(t *testing.T) {
+	stub := &canvasStub{}
+	s := newTestSignaller(t, stub)
+	s.on(5)
+	s.on(21) // same worker as 5 (21 % 16 == 5): must arrive after it
+	s.off(5)
+	s.on(6)
+	s.flush()
+	if n := s.unconfirmed(); n != 0 {
+		t.Fatalf("unconfirmed = %d, want 0", n)
+	}
+	stub.mu.Lock()
+	defer stub.mu.Unlock()
+	if len(stub.got) != 4 {
+		t.Fatalf("got %d requests %v, want 4", len(stub.got), stub.got)
+	}
+	for _, p := range []string{"/on/5", "/on/21", "/off/5", "/on/6"} {
+		if !stub.auth[p] {
+			t.Fatalf("%s missing or wrong bearer token (or never arrived): %v", p, stub.got)
+		}
+	}
+	// Ordering within one id is what keeps a tile from ending up wrong: ON
+	// then OFF for 5, with 21 (same worker) between them in submission order.
+	var sameWorker []string
+	for _, g := range stub.got {
+		if g != "POST /on/6" {
+			sameWorker = append(sameWorker, g)
+		}
+	}
+	if want := []string{"POST /on/5", "POST /on/21", "POST /off/5"}; strings.Join(sameWorker, ",") != strings.Join(want, ",") {
+		t.Fatalf("same-worker order = %v, want %v", sameWorker, want)
+	}
+}
+
+func TestSignallerConfirmRetries(t *testing.T) {
+	stub := &canvasStub{failFirst: true}
+	s := newTestSignaller(t, stub)
+	s.on(1)
+	s.off(1)
+	s.flush()
+	if n := s.unconfirmed(); n != 0 {
+		t.Fatalf("unconfirmed = %d, want 0 after retry", n)
+	}
+	stub.mu.Lock()
+	defer stub.mu.Unlock()
+	if stub.seen["/on/1"] != 2 || stub.seen["/off/1"] != 2 {
+		t.Fatalf("attempts = %v, want 2 each (one 503, one success)", stub.seen)
+	}
+	if strings.Join(stub.got, ",") != "POST /on/1,POST /off/1" {
+		t.Fatalf("order = %v", stub.got)
+	}
+}
+
+func TestSignallerConfirmGivesUpOn4xx(t *testing.T) {
+	s := newTestSignaller(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	s.on(1)
+	s.flush()
+	if n := s.unconfirmed(); n != 1 {
+		t.Fatalf("unconfirmed = %d, want 1 (rejected, not retried forever)", n)
+	}
+}
+
+func TestSignallerConfirmIsIdempotentForHTTPRetries(t *testing.T) {
+	var key atomic.Value
+	s := newTestSignaller(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		key.Store(r.Header.Get("Idempotency-Key"))
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	s.off(42)
+	s.flush()
+	if got, _ := key.Load().(string); got != "off-42" {
+		t.Fatalf("Idempotency-Key = %q, want off-42 (lets net/http replay on a dead keep-alive conn)", got)
 	}
 }

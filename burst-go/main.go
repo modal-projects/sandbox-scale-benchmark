@@ -66,7 +66,9 @@ import (
 	"io"
 	"log"
 	"math"
+	"math/rand/v2"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -120,8 +122,10 @@ var (
 	signalPort    = flag.Int("signal-port", 7777, "UDP port on -signal-host")
 	signalToken   = flag.String("signal-token", "", "shared token the canvas expects in front of every signal (default: $SIGNAL_TOKEN)")
 	signalBase    = flag.Int("signal-base", 0, "id of this run's first Sandbox on the canvas")
-	signalRepeat  = flag.Int("signal-repeat", 2, "send each ON/OFF datagram this many times, spaced -signal-spacing apart, so a single lost packet doesn't leave a tile stale (1 = no repeats)")
-	signalSpacing = flag.Duration("signal-spacing", 100*time.Millisecond, "gap between repeats of the same signal")
+	signalRepeat  = flag.Int("signal-repeat", 3, "send each ON/OFF datagram this many times, spaced -signal-spacing apart, so a burst of packet loss doesn't leave a tile stale (1 = no repeats)")
+	signalSpacing = flag.Duration("signal-spacing", 500*time.Millisecond, "gap between repeats of the same signal; wider than any loss blip seen so far")
+	signalConfirm = flag.Bool("signal-confirm", true, "also POST every ON/OFF to the canvas over HTTP (TCP, retried) so UDP loss can't leave a tile wrong")
+	signalHTTP    = flag.Int("signal-http-port", 8080, "HTTP port on -signal-host for -signal-confirm")
 )
 
 var (
@@ -151,12 +155,18 @@ var (
 	bootLimiter <-chan struct{}
 )
 
-// signaller sends the canvas a datagram per Sandbox state change:
-// [token][id uint32 LE][kind], kind 1 = ON, 0 = OFF. Datagrams are
-// fire-and-forget and never fail a session; each is sent repeat times,
-// spacing apart, because the canvas has no TTL and a single lost OFF would
-// leave a tile lit forever (or a lost ON dark). The canvas is idempotent, so
-// duplicates cost it nothing.
+// signaller tells the canvas about each Sandbox state change over two paths:
+//
+//   - a UDP datagram [token][id uint32 LE][kind], kind 1 = ON, 0 = OFF, sent
+//     repeat times spacing apart. Fire-and-forget and instant, so the canvas
+//     tracks the run live; the repeats ride out short loss blips.
+//   - an HTTP POST /on/{id} or /off/{id}, when confirm is set. TCP retransmits
+//     what the network dropped, so the canvas ends up right even when every
+//     datagram for an id was lost. The canvas has no TTL: a lost OFF is a tile
+//     lit forever, a lost ON a tile that never lights.
+//
+// Both paths are idempotent on the canvas, so duplicates cost nothing, and
+// neither can fail a session.
 type signaller struct {
 	token   string
 	conn    net.Conn
@@ -164,23 +174,42 @@ type signaller struct {
 	spacing time.Duration
 	// Repeats still waiting for their timer; flush waits for them.
 	pending sync.WaitGroup
+
+	confirm *confirmer // nil = UDP only
 }
 
-func newSignaller(host string, port int, token string, repeat int, spacing time.Duration) (*signaller, error) {
-	if host == "" {
+type signalOpts struct {
+	host     string
+	port     int // UDP
+	httpPort int
+	token    string
+	repeat   int
+	spacing  time.Duration
+	confirm  bool
+	// Sandboxes this process will signal for; sizes the confirm queues so a
+	// slow canvas never blocks a session.
+	expected int
+}
+
+func newSignaller(o signalOpts) (*signaller, error) {
+	if o.host == "" {
 		return nil, nil
 	}
-	if token == "" {
+	if o.token == "" {
 		return nil, errors.New("-signal-host needs a token: pass -signal-token or set $SIGNAL_TOKEN")
 	}
-	if repeat < 1 {
-		return nil, fmt.Errorf("-signal-repeat must be >= 1, got %d", repeat)
+	if o.repeat < 1 {
+		return nil, fmt.Errorf("-signal-repeat must be >= 1, got %d", o.repeat)
 	}
-	conn, err := net.Dial("udp", net.JoinHostPort(host, strconv.Itoa(port)))
+	conn, err := net.Dial("udp", net.JoinHostPort(o.host, strconv.Itoa(o.port)))
 	if err != nil {
-		return nil, fmt.Errorf("dial %s: %w", host, err)
+		return nil, fmt.Errorf("dial %s: %w", o.host, err)
 	}
-	return &signaller{token: token, conn: conn, repeat: repeat, spacing: spacing}, nil
+	s := &signaller{token: o.token, conn: conn, repeat: o.repeat, spacing: o.spacing}
+	if o.confirm {
+		s.confirm = newConfirmer("http://"+net.JoinHostPort(o.host, strconv.Itoa(o.httpPort)), o.token, o.expected)
+	}
+	return s, nil
 }
 
 func signalPacket(token string, id int, kind byte) []byte {
@@ -204,18 +233,181 @@ func (s *signaller) send(id int, kind byte) {
 			s.conn.Write(p) //nolint:errcheck // best-effort
 		})
 	}
+	s.confirm.enqueue(id, kind)
 }
 
 func (s *signaller) on(id int)  { s.send(id, 1) }
 func (s *signaller) off(id int) { s.send(id, 0) }
 
-// flush blocks until every scheduled repeat has been written. Call it before
-// the process exits, or the last Sandboxes' OFF repeats are lost with it.
+// flush blocks until every scheduled repeat has been written and every HTTP
+// confirmation has been answered (or given up on). Call it before the process
+// exits, or the last Sandboxes' OFFs are lost with it.
 func (s *signaller) flush() {
 	if s == nil {
 		return
 	}
 	s.pending.Wait()
+	s.confirm.flush()
+}
+
+// unconfirmed is how many state changes the canvas never acknowledged over
+// HTTP after retries; each one is a tile that may be wrong.
+func (s *signaller) unconfirmed() int64 {
+	if s == nil || s.confirm == nil {
+		return 0
+	}
+	return s.confirm.failed.Load()
+}
+
+const (
+	// Parallel HTTP connections to the canvas per process. Ids are dealt to
+	// workers by id, so one id's ON and OFF share a worker and stay ordered.
+	confirmWorkers = 16
+	// Attempts per signal before it is counted unconfirmed.
+	confirmAttempts = 8
+	// Longest flush waits for the backlog after the last session, so a canvas
+	// that went away can't keep a runner alive indefinitely.
+	confirmFlushTimeout = 3 * time.Minute
+)
+
+type confirmJob struct {
+	id   int
+	kind byte
+}
+
+// confirmer POSTs state changes to the canvas over HTTP from a fixed pool of
+// keep-alive connections. Requests are retried with backoff; they are also
+// marked idempotent so the HTTP client itself replays one that died on a
+// stale keep-alive connection.
+type confirmer struct {
+	base    string
+	token   string
+	client  *http.Client
+	backoff time.Duration
+	queues  []chan confirmJob
+	workers sync.WaitGroup
+	failed  atomic.Int64
+	logged  atomic.Int64
+	closed  atomic.Bool
+}
+
+func newConfirmer(base, token string, expected int) *confirmer {
+	c := &confirmer{
+		base:  base,
+		token: token,
+		client: &http.Client{
+			Timeout: 10 * time.Second,
+			Transport: &http.Transport{
+				DialContext:         (&net.Dialer{Timeout: 5 * time.Second}).DialContext,
+				MaxIdleConns:        confirmWorkers,
+				MaxIdleConnsPerHost: confirmWorkers,
+				MaxConnsPerHost:     confirmWorkers,
+				// Shorter than the load balancer's idle timeout, so a connection
+				// that sat through the -lifetime hold is redialed, not reused dead.
+				IdleConnTimeout: 60 * time.Second,
+			},
+		},
+		backoff: 250 * time.Millisecond,
+	}
+	// Every Sandbox produces one ON and one OFF; give each worker room for its
+	// whole share so enqueue never blocks a session behind a slow canvas.
+	depth := max(1024, 2*expected/confirmWorkers+1)
+	c.queues = make([]chan confirmJob, confirmWorkers)
+	for i := range c.queues {
+		c.queues[i] = make(chan confirmJob, depth)
+		c.workers.Add(1)
+		go c.worker(c.queues[i])
+	}
+	return c
+}
+
+func (c *confirmer) enqueue(id int, kind byte) {
+	if c == nil || c.closed.Load() {
+		return
+	}
+	c.queues[id%len(c.queues)] <- confirmJob{id: id, kind: kind}
+}
+
+func (c *confirmer) worker(q chan confirmJob) {
+	defer c.workers.Done()
+	for j := range q {
+		if err := c.post(j); err != nil {
+			c.failed.Add(1)
+			if c.logged.Add(1) <= 10 {
+				log.Printf("signal confirm %s %d: %v", kindName(j.kind), j.id, err)
+			}
+		}
+	}
+}
+
+func kindName(kind byte) string {
+	if kind == 1 {
+		return "on"
+	}
+	return "off"
+}
+
+// post retries transport errors and 5xx with exponential backoff. A 4xx is
+// final: the canvas understood us and said no (wrong token, bad id), and
+// retrying would not change that.
+func (c *confirmer) post(j confirmJob) error {
+	url := c.base + "/" + kindName(j.kind) + "/" + strconv.Itoa(j.id)
+	var last error
+	for attempt := 0; attempt < confirmAttempts; attempt++ {
+		if attempt > 0 {
+			d := c.backoff << (attempt - 1)
+			d = min(d, 8*time.Second)
+			time.Sleep(d/2 + rand.N(d/2+1))
+		}
+		req, err := http.NewRequest(http.MethodPost, url, http.NoBody)
+		if err != nil {
+			return err
+		}
+		req.Header.Set("Authorization", "Bearer "+c.token)
+		req.Header.Set("Idempotency-Key", kindName(j.kind)+"-"+strconv.Itoa(j.id))
+		resp, err := c.client.Do(req)
+		if err != nil {
+			last = err
+			continue
+		}
+		io.Copy(io.Discard, resp.Body) //nolint:errcheck
+		resp.Body.Close()              //nolint:errcheck
+		switch {
+		case resp.StatusCode < 300:
+			return nil
+		case resp.StatusCode < 500:
+			return fmt.Errorf("canvas rejected it: HTTP %d", resp.StatusCode)
+		default:
+			last = fmt.Errorf("HTTP %d", resp.StatusCode)
+		}
+	}
+	return fmt.Errorf("gave up after %d attempts: %w", confirmAttempts, last)
+}
+
+// flush closes the queues and waits for the backlog, bounded by
+// confirmFlushTimeout. Nothing may enqueue after it.
+func (c *confirmer) flush() {
+	if c == nil || !c.closed.CompareAndSwap(false, true) {
+		return
+	}
+	for _, q := range c.queues {
+		close(q)
+	}
+	done := make(chan struct{})
+	go func() {
+		c.workers.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(confirmFlushTimeout):
+		pending := 0
+		for _, q := range c.queues {
+			pending += len(q)
+		}
+		c.failed.Add(int64(pending))
+		log.Printf("signal confirm: gave up waiting for %d queued confirmations after %s", pending, confirmFlushTimeout)
+	}
 }
 
 // shardSignalBase is the canvas id of shard i's first Sandbox, matching how
@@ -469,6 +661,8 @@ type aggregateDurations struct {
 	missed    atomic.Int64
 	retries   atomic.Int64
 	ready     atomic.Int64
+	// Canvas signals no shard could confirm over HTTP.
+	unconfirmed atomic.Int64
 }
 
 func (a *aggregateDurations) add(op string, batch []time.Duration) {
@@ -508,9 +702,19 @@ func (a *aggregateDurations) report() {
 	if r := a.retries.Load(); r > 0 {
 		fmt.Printf("exec retries (transport failures a second attempt recovered): %d\n", r)
 	}
+	reportUnconfirmed(a.unconfirmed.Load())
 	merged := &metrics{durations: byOp}
 	merged.report(false)
 	a.fails.report(false)
+}
+
+// reportUnconfirmed warns when canvas signals went unacknowledged, since each
+// is a tile that may show the wrong state until it is fixed by hand.
+func reportUnconfirmed(n int64) {
+	if n > 0 {
+		fmt.Printf("WARNING: %d canvas signals were not confirmed over HTTP; that many tiles may be wrong\n"+
+			"         (check the canvas /stats and clear stragglers with POST /off/{id})\n", n)
+	}
 }
 
 // pct returns the nearest-rank percentile (index ceil(p*n)-1) of an ascending
@@ -1013,6 +1217,8 @@ func runShard(ctx context.Context, mc *modal.Client, app *modal.App, runner *mod
 			"-signal-base", strconv.Itoa(shardSignalBase(*signalBase, *total, *shards, idx)),
 			"-signal-repeat", strconv.Itoa(*signalRepeat),
 			"-signal-spacing", signalSpacing.String(),
+			"-signal-confirm="+strconv.FormatBool(*signalConfirm),
+			"-signal-http-port", strconv.Itoa(*signalHTTP),
 		)
 	}
 	run, err := sb.Exec(ctx, cmd, &modal.SandboxExecParams{Env: env})
@@ -1060,6 +1266,10 @@ func runShard(ctx context.Context, mc *modal.Client, app *modal.App, runner *mod
 				}
 				if n, ok := parseCountLine(line, "#ready "); ok {
 					agg.ready.Add(n)
+					continue
+				}
+				if n, ok := parseCountLine(line, "#unconfirmed "); ok {
+					agg.unconfirmed.Add(n)
 					continue
 				}
 				fmt.Printf("[shard %d] %s\n", idx, line)
@@ -1248,13 +1458,20 @@ Flags:
 	if *signalToken == "" {
 		*signalToken = os.Getenv("SIGNAL_TOKEN")
 	}
-	sig, err := newSignaller(*signalHost, *signalPort, *signalToken, *signalRepeat, *signalSpacing)
+	sig, err := newSignaller(signalOpts{
+		host: *signalHost, port: *signalPort, httpPort: *signalHTTP, token: *signalToken,
+		repeat: *signalRepeat, spacing: *signalSpacing, confirm: *signalConfirm, expected: *total,
+	})
 	if err != nil {
 		log.Fatalf("signals: %v", err)
 	}
 	if sig != nil {
-		log.Printf("signals -> udp://%s:%d ids %d..%d, each sent %dx (token: %d chars)",
-			*signalHost, *signalPort, *signalBase, *signalBase+*total-1, *signalRepeat, len(*signalToken))
+		confirm := "no HTTP confirm"
+		if *signalConfirm {
+			confirm = fmt.Sprintf("confirmed over http://%s:%d", *signalHost, *signalHTTP)
+		}
+		log.Printf("signals -> udp://%s:%d ids %d..%d, each sent %dx %s apart, %s (token: %d chars)",
+			*signalHost, *signalPort, *signalBase, *signalBase+*total-1, *signalRepeat, *signalSpacing, confirm, len(*signalToken))
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
@@ -1411,6 +1628,7 @@ Flags:
 		}
 		fmt.Printf("#retries %d\n", execRetries.Load())
 		fmt.Printf("#ready %d\n", ready.Load())
+		fmt.Printf("#unconfirmed %d\n", sig.unconfirmed())
 		m.report(true)
 		fails.report(true)
 		return
@@ -1428,6 +1646,7 @@ Flags:
 		created.Load(), createSpan.Round(time.Millisecond), sustained,
 		peakLive.Load(), ready.Load(), failures.Load(), execRetries.Load())
 	fmt.Printf("wall %s, which includes the %s lifetime hold\n\n", elapsed.Round(time.Second), lifetime.String())
+	reportUnconfirmed(sig.unconfirmed())
 	m.report(false)
 	fails.report(false)
 }
