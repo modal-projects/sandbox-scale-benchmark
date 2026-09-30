@@ -73,6 +73,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -83,6 +84,8 @@ import (
 	toml "github.com/pelletier/go-toml/v2"
 
 	modal "github.com/modal-labs/modal-client/go"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // Two file reads and a checksum: enough to prove the Sandbox is usable, with
@@ -138,8 +141,10 @@ var (
 	failures atomic.Int64
 	// Exec attempts that failed on transport and were retried.
 	execRetries atomic.Int64
-	live        atomic.Int64
-	peakLive    atomic.Int64
+	// Create calls that failed with a retryable status and were retried.
+	createRetries atomic.Int64
+	live          atomic.Int64
+	peakLive      atomic.Int64
 
 	// Bounds of the create phase, as Unix nanos. Sustained create rate is
 	// measured over this window, not over total elapsed time, which would be
@@ -650,17 +655,18 @@ func parsePeakLine(line string) (int64, bool) { return parseCountLine(line, "#pe
 // aggregateDurations merges every shard's raw samples so the driver can compute
 // true percentiles over the combined distribution.
 type aggregateDurations struct {
-	mu        sync.Mutex
-	byOp      map[string][]time.Duration
-	fails     failureCounts
-	peakSum   atomic.Int64
-	shardsIn  atomic.Int64
-	winFirst  atomic.Int64
-	winLast   atomic.Int64
-	winCreate atomic.Int64
-	missed    atomic.Int64
-	retries   atomic.Int64
-	ready     atomic.Int64
+	mu            sync.Mutex
+	byOp          map[string][]time.Duration
+	fails         failureCounts
+	peakSum       atomic.Int64
+	shardsIn      atomic.Int64
+	winFirst      atomic.Int64
+	winLast       atomic.Int64
+	winCreate     atomic.Int64
+	missed        atomic.Int64
+	retries       atomic.Int64
+	createRetries atomic.Int64
+	ready         atomic.Int64
 	// Canvas signals no shard could confirm over HTTP.
 	unconfirmed atomic.Int64
 }
@@ -699,6 +705,9 @@ func (a *aggregateDurations) report() {
 	// is an upper bound on true global peak concurrency, not a measurement.
 	fmt.Printf("peak live Sandboxes (sum of %d shard peaks, upper bound): %d\n",
 		a.shardsIn.Load(), a.peakSum.Load())
+	if r := a.createRetries.Load(); r > 0 {
+		fmt.Printf("create retries (retryable API errors that were retried): %d\n", r)
+	}
 	if r := a.retries.Load(); r > 0 {
 		fmt.Printf("exec retries (transport failures that were retried): %d\n", r)
 	}
@@ -781,6 +790,48 @@ func terminate(ctx context.Context, sb *modal.Sandbox) {
 	tctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 60*time.Second)
 	defer cancel()
 	sb.Terminate(tctx, nil) //nolint:errcheck // best-effort cleanup
+}
+
+// The SDK already retries a create on Unavailable/Internal/Unknown/DeadlineExceeded
+// three times within about a second, under one idempotency key. These outer
+// attempts (1s, 2s, 4s apart) ride out anything longer than that: an API pod
+// restarting, a scheduler rollout, a momentary capacity shortfall. Each outer
+// attempt is a fresh request, so a create that succeeded server-side but whose
+// reply was lost leaves an orphan Sandbox that the platform reaps at its Timeout.
+const (
+	createAttempts     = 4
+	createRetryBackoff = time.Second
+)
+
+func createSandbox(ctx context.Context, mc *modal.Client, app *modal.App, image *modal.Image, params *modal.SandboxCreateParams) (*modal.Sandbox, error) {
+	backoff := createRetryBackoff
+	for attempt := 1; ; attempt++ {
+		sb, err := mc.Sandboxes.ExperimentalCreate(ctx, app, image, params)
+		if err == nil || !retryableStatus(err, codes.ResourceExhausted, codes.Aborted) || ctx.Err() != nil || attempt >= createAttempts {
+			return sb, err
+		}
+		createRetries.Add(1)
+		select {
+		case <-time.After(backoff):
+		case <-ctx.Done():
+			return nil, err
+		}
+		backoff *= 2
+	}
+}
+
+// retryableStatus reports whether err is a gRPC status a fresh request can
+// plausibly clear: the transport-level codes, plus any extra codes given.
+func retryableStatus(err error, extra ...codes.Code) bool {
+	st, ok := status.FromError(err)
+	if !ok {
+		return false
+	}
+	switch st.Code() {
+	case codes.Unavailable, codes.DeadlineExceeded, codes.Internal, codes.Unknown:
+		return true
+	}
+	return slices.Contains(extra, st.Code())
 }
 
 // Transport failures (the runner's DNS resolver timing out on the Sandbox's
@@ -888,7 +939,7 @@ func session(ctx context.Context, mc *modal.Client, app *modal.App, image *modal
 	start := time.Now()
 	// No CPU or MemoryMiB: a default-sized Sandbox is what the capacity buffer
 	// is sized in, so asking for anything else measures a different thing.
-	sb, err := mc.Sandboxes.ExperimentalCreate(ctx, app, image, &modal.SandboxCreateParams{
+	sb, err := createSandbox(ctx, mc, app, image, &modal.SandboxCreateParams{
 		Command: []string{"sleep", "infinity"},
 		// Whole seconds: the SDK rejects a fractional Sandbox Timeout too.
 		Timeout: (*lifetime + timeoutMargin).Truncate(time.Second),
@@ -1185,7 +1236,7 @@ func runShard(ctx context.Context, mc *modal.Client, app *modal.App, runner *mod
 	// Runners are load generators, not the thing under test, so they get real
 	// resources rather than the default Sandbox shape.
 	createStart := time.Now()
-	sb, err := mc.Sandboxes.ExperimentalCreate(ctx, app, runner, &modal.SandboxCreateParams{
+	sb, err := createSandbox(ctx, mc, app, runner, &modal.SandboxCreateParams{
 		Command:   []string{"sleep", "infinity"},
 		CPU:       *runnerCPU,
 		MemoryMiB: *runnerMemory,
@@ -1232,7 +1283,22 @@ func runShard(ctx context.Context, mc *modal.Client, app *modal.App, runner *mod
 			"-signal-http-port", strconv.Itoa(*signalHTTP),
 		)
 	}
-	run, err := sb.Exec(ctx, cmd, &modal.SandboxExecParams{Env: env})
+	// Starting the shard is the same task-*.w.modal.host exec that the workload
+	// retries on DNS failure, and a shard lost here is shardTotal Sandboxes
+	// never created. Only Unavailable is retried: the request never reached the
+	// runner, so a second exec cannot start the load twice.
+	var run *modal.ContainerProcess
+	for attempt := 1; ; attempt++ {
+		run, err = sb.Exec(ctx, cmd, &modal.SandboxExecParams{Env: env})
+		if err == nil || status.Code(err) != codes.Unavailable || ctx.Err() != nil || attempt >= execAttempts {
+			break
+		}
+		log.Printf("[shard %d] start load test (attempt %d): %v; retrying", idx, attempt, err)
+		select {
+		case <-time.After(execRetryBackoff * time.Duration(attempt)):
+		case <-ctx.Done():
+		}
+	}
 	if err != nil {
 		return fmt.Errorf("start load test: %w", err)
 	}
@@ -1273,6 +1339,10 @@ func runShard(ctx context.Context, mc *modal.Client, app *modal.App, runner *mod
 				}
 				if n, ok := parseCountLine(line, "#retries "); ok {
 					agg.retries.Add(n)
+					continue
+				}
+				if n, ok := parseCountLine(line, "#create-retries "); ok {
+					agg.createRetries.Add(n)
 					continue
 				}
 				if n, ok := parseCountLine(line, "#ready "); ok {
@@ -1638,6 +1708,7 @@ Flags:
 			fmt.Printf("#missed 1\n")
 		}
 		fmt.Printf("#retries %d\n", execRetries.Load())
+		fmt.Printf("#create-retries %d\n", createRetries.Load())
 		fmt.Printf("#ready %d\n", ready.Load())
 		fmt.Printf("#unconfirmed %d\n", sig.unconfirmed())
 		m.report(true)
@@ -1653,9 +1724,9 @@ Flags:
 		Interrupted: ctx.Err() != nil,
 	})
 	createSpan, sustained := createWindow()
-	fmt.Printf("\ncreated %d Sandboxes in %s of creates (%.0f/s sustained), peak %d live, %d ready, %d failed, %d exec retries\n",
+	fmt.Printf("\ncreated %d Sandboxes in %s of creates (%.0f/s sustained), peak %d live, %d ready, %d failed, %d create retries, %d exec retries\n",
 		created.Load(), createSpan.Round(time.Millisecond), sustained,
-		peakLive.Load(), ready.Load(), failures.Load(), execRetries.Load())
+		peakLive.Load(), ready.Load(), failures.Load(), createRetries.Load(), execRetries.Load())
 	fmt.Printf("wall %s, which includes the %s lifetime hold\n\n", elapsed.Round(time.Second), lifetime.String())
 	reportUnconfirmed(sig.unconfirmed())
 	m.report(false)

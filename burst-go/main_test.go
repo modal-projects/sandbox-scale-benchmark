@@ -15,6 +15,9 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 func TestHistoryRoundTrip(t *testing.T) {
@@ -243,6 +246,28 @@ func TestBadExitIsNotRetried(t *testing.T) {
 	}
 	if errors.As(fmt.Errorf("exec: %w", context.DeadlineExceeded), &exit) {
 		t.Error("a transport failure was classified as a bad exit")
+	}
+}
+
+func TestRetryableStatus(t *testing.T) {
+	cases := []struct {
+		err   error
+		extra []codes.Code
+		want  bool
+	}{
+		{status.Error(codes.Unavailable, "dns: A record lookup error"), nil, true},
+		{fmt.Errorf("create sandbox: %w", status.Error(codes.Internal, "boom")), nil, true},
+		{status.Error(codes.InvalidArgument, "bad timeout"), nil, false},
+		{status.Error(codes.PermissionDenied, "no"), nil, false},
+		{status.Error(codes.ResourceExhausted, "no capacity"), nil, false},
+		{status.Error(codes.ResourceExhausted, "no capacity"), []codes.Code{codes.ResourceExhausted}, true},
+		{errors.New("plain error"), nil, false},
+		{badExit{code: 1}, nil, false},
+	}
+	for _, c := range cases {
+		if got := retryableStatus(c.err, c.extra...); got != c.want {
+			t.Errorf("retryableStatus(%v, %v) = %v, want %v", c.err, c.extra, got, c.want)
+		}
 	}
 }
 
