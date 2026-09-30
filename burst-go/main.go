@@ -136,7 +136,7 @@ var (
 	created  atomic.Int64
 	ready    atomic.Int64
 	failures atomic.Int64
-	// Transport failures that a second attempt recovered from.
+	// Exec attempts that failed on transport and were retried.
 	execRetries atomic.Int64
 	live        atomic.Int64
 	peakLive    atomic.Int64
@@ -700,7 +700,7 @@ func (a *aggregateDurations) report() {
 	fmt.Printf("peak live Sandboxes (sum of %d shard peaks, upper bound): %d\n",
 		a.shardsIn.Load(), a.peakSum.Load())
 	if r := a.retries.Load(); r > 0 {
-		fmt.Printf("exec retries (transport failures a second attempt recovered): %d\n", r)
+		fmt.Printf("exec retries (transport failures that were retried): %d\n", r)
 	}
 	reportUnconfirmed(a.unconfirmed.Load())
 	merged := &metrics{durations: byOp}
@@ -783,7 +783,15 @@ func terminate(ctx context.Context, sb *modal.Sandbox) {
 	sb.Terminate(tctx, nil) //nolint:errcheck // best-effort cleanup
 }
 
-const execRetryBackoff = time.Second
+// Transport failures (the runner's DNS resolver timing out on the Sandbox's
+// task-*.w.modal.host name is the common one) are retried with exponential
+// backoff: 1s, 2s, 4s, 8s, 8s, ... between attempts, up to execAttempts in
+// total, all inside the one -exec-timeout budget.
+const (
+	execAttempts        = 6
+	execRetryBackoff    = time.Second
+	execRetryBackoffMax = 8 * time.Second
+)
 
 // badExit is a command that ran and returned non-zero. It is kept distinct from
 // transport failures because retrying it would just fail the same way.
@@ -792,24 +800,27 @@ type badExit struct{ code int }
 func (e badExit) Error() string { return fmt.Sprintf("command exited with code %d", e.code) }
 
 // runCmd executes a shell command in the Sandbox and checks its exit code,
-// retrying a transport failure once. Both attempts share one -exec-timeout
-// budget, so a stuck Sandbox still gives up on schedule rather than doubling.
+// retrying transport failures. All attempts share one -exec-timeout budget, so
+// a stuck Sandbox still gives up on schedule rather than multiplying it.
 func runCmd(ctx context.Context, sb *modal.Sandbox, cmd string, timeout time.Duration) error {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	err := execOnce(ctx, sb, cmd, timeout)
-	var exit badExit
-	if err == nil || errors.As(err, &exit) || ctx.Err() != nil {
-		return err
+	backoff := execRetryBackoff
+	for attempt := 1; ; attempt++ {
+		err := execOnce(ctx, sb, cmd, timeout)
+		var exit badExit
+		if err == nil || errors.As(err, &exit) || ctx.Err() != nil || attempt >= execAttempts {
+			return err
+		}
+		execRetries.Add(1)
+		select {
+		case <-time.After(backoff):
+		case <-ctx.Done():
+			return err
+		}
+		backoff = min(backoff*2, execRetryBackoffMax)
 	}
-	execRetries.Add(1)
-	select {
-	case <-time.After(execRetryBackoff):
-	case <-ctx.Done():
-		return err
-	}
-	return execOnce(ctx, sb, cmd, timeout)
 }
 
 // execOnce is a single attempt. It never reads stdout, so the SDK's lazy output
