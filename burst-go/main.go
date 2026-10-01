@@ -120,7 +120,8 @@ var (
 	force         = flag.Bool("force", false, "skip the confirm step when -total is a large jump over the largest recent clean run")
 
 	// Liveness signals for the million-sandboxes canvas: Sandbox i of the run
-	// lights tile -signal-base+i for as long as it is alive.
+	// lights tile -signal-base+i from the moment it is proven usable until it
+	// is terminated.
 	signalHost    = flag.String("signal-host", "", "million-sandboxes canvas host to send per-Sandbox ON/OFF UDP signals to (empty = no signals)")
 	signalPort    = flag.Int("signal-port", 7777, "UDP port on -signal-host")
 	signalToken   = flag.String("signal-token", "", "shared token the canvas expects in front of every signal (default: $SIGNAL_TOKEN)")
@@ -958,11 +959,15 @@ func session(ctx context.Context, mc *modal.Client, app *modal.App, image *modal
 	recordMin(&firstCreateNs, start.UnixNano())
 	recordMax(&lastCreateNs, createdAt.UnixNano())
 	recordPeak(live.Add(1))
-	sig.on(*signalBase + idx)
+	// A tile lights only once the Sandbox has proven usable (the workload exec
+	// passed), so a lit tile never stands for a container that never came up.
+	lit := false
 	defer func() {
 		terminate(ctx, sb)
 		live.Add(-1)
-		sig.off(*signalBase + idx)
+		if lit {
+			sig.off(*signalBase + idx)
+		}
 	}()
 
 	// An empty -cmd skips the exec entirely. The first exec on a Sandbox both
@@ -978,6 +983,8 @@ func session(ctx context.Context, mc *modal.Client, app *modal.App, image *modal
 		m.record("ready", done.Sub(start))
 	}
 	ready.Add(1)
+	sig.on(*signalBase + idx)
+	lit = true
 
 	// Hold the Sandbox for the rest of its lifetime, so the run reaches a real
 	// concurrency plateau instead of only measuring create throughput.
@@ -1464,7 +1471,8 @@ reach Modal. alpine:3.21 does; debian:bookworm-slim does not. Runners live in
 -runner-app (default <app>-runners) so -app holds exactly the workload Sandboxes.
 
 With -signal-host, every Sandbox lights one tile on a million-sandboxes canvas
-(UDP ON after create, OFF after terminate; id = -signal-base + its index).
+(ON once its workload exec has passed, or right after create with -cmd "";
+OFF after terminate; id = -signal-base + its index).
 
 Each run is appended to -history. If -total is more than 2x the largest clean
 run of the last 7 days (or above 500 with none), burst asks before running:
